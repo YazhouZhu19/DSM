@@ -1,1 +1,1 @@
-### Cross-domain Few-shot Medical Image Segmentation
+### Generalizable Few-shot Medical Image Segmentation
