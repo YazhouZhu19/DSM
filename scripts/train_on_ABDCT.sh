@@ -26,14 +26,14 @@ for EVAL_FOLD in "${ALL_EV[@]}"
 do
   PREFIX="train_${DATASET}_cv${EVAL_FOLD}"
   echo $PREFIX
-  LOGDIR="./exps_train_on_${DATASET}_interaction"
+  LOGDIR="./exps_train_on_${DATASET}"
 
   if [ ! -d $LOGDIR ]
   then
     mkdir -p $LOGDIR
   fi
 
-  python3 train_interaction.py with \
+  python3 train.py with \
   mode='train' \
   dataset=$DATASET \
   num_workers=$NWORKER \
