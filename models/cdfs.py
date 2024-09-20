@@ -1,3 +1,6 @@
+"""
+encoder resnet50, GNN geometrical feature extractor, feature transform operation
+"""
 from re import A
 from tkinter import W
 import numpy as np
@@ -20,6 +23,7 @@ import torchvision.models as models
 from .base.feature import extract_feat_vgg, extract_feat_res
 from .base.correlation import Correlation
 from .learner import MixedLearner
+# from .learner import Matching
 import matplotlib.pyplot as plt
 
 
@@ -151,7 +155,6 @@ class MultiHeadAttention(nn.Module):
         out = out.transpose(1, 2).reshape(out.shape[0], -1, out.shape[-1] * self.heads)
         return self.to_out(out)
 
-
 class innerProtoFusion(nn.Module):
     def __init__(self, feature_dim=512):
         super().__init__()
@@ -177,8 +180,112 @@ class innerProtoFusion(nn.Module):
         
         return fused_feature
 
+class Weighting(nn.Module):
+    def __init__(self, in_channels=512, max_hidden_layers=10):
+        super(Weighting, self).__init__()
+        self.in_channels = in_channels
+        self.max_hidden_layers = max_hidden_layers
+        
+        # Original convolutional layers
+        self.query_conv = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
+        self.key_conv = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
+        self.value_conv1 = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+        self.value_conv2 = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+        
+        # Learnable weights for combining hidden features
+        self.hidden_weights1 = nn.Parameter(torch.ones(max_hidden_layers))
+        self.hidden_weights2 = nn.Parameter(torch.ones(max_hidden_layers))
+        
+        # Layers for gamma generation
+        self.gamma_gen1 = nn.Sequential(
+            nn.Linear(in_channels, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        )
+        self.gamma_gen2 = nn.Sequential(
+            nn.Linear(in_channels, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        )
 
-class Weighting
+    def forward(self, x, y, x_hidden, y_hidden):
+        batch_size, C, H, W = x.size()
+
+        # Compute Query, Key, and Values
+        query = self.query_conv(x).view(batch_size, -1, H * W).permute(0, 2, 1)
+        key = self.key_conv(y).view(batch_size, -1, H * W)
+        value1 = self.value_conv1(x).view(batch_size, -1, H * W)
+        value2 = self.value_conv2(y).view(batch_size, -1, H * W)
+
+        # Calculate attention
+        attention = torch.bmm(query, key)
+        attention = F.softmax(attention, dim=-1)
+
+        # Apply attention to both values
+        out1 = torch.bmm(value1, attention.permute(0, 2, 1))
+        out2 = torch.bmm(value2, attention)
+
+        # Reshape outputs
+        out1 = out1.view(batch_size, C, H, W)
+        out2 = out2.view(batch_size, C, H, W)
+
+        # Combine hidden features with learnable weights
+        num_layers = min(len(x_hidden), self.max_hidden_layers)
+        x_weights = F.softmax(self.hidden_weights1[:num_layers], dim=0)
+        y_weights = F.softmax(self.hidden_weights2[:num_layers], dim=0)
+        
+        x_hidden_weighted = sum([w * h.mean(dim=[2, 3]) for w, h in zip(x_weights, x_hidden[:num_layers])])
+        y_hidden_weighted = sum([w * h.mean(dim=[2, 3]) for w, h in zip(y_weights, y_hidden[:num_layers])])
+
+        # Generate gammas using weighted hidden features
+        gamma1 = self.gamma_gen1(x_hidden_weighted).view(batch_size, 1, 1, 1)
+        gamma2 = self.gamma_gen2(y_hidden_weighted).view(batch_size, 1, 1, 1)
+
+        # Apply gamma and add residual connection
+        out1 = gamma1 * out1 + x
+        out2 = gamma2 * out2 + y
+
+        return out1, out2
+
+class Weighting_old(nn.Module):
+    def __init__(self, in_channels=512):
+        super(Weighting_old, self).__init__()
+        self.in_channels = in_channels
+        self.query_conv = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
+        self.key_conv = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
+        self.value_conv1 = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+        self.value_conv2 = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+        self.gamma1 = nn.Parameter(torch.zeros(1))
+        self.gamma2 = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x, y):
+        # x, y: (batch_size, in_channels, H, W)
+        batch_size, C, H, W = x.size()
+
+        # Compute Query, Key, and Values
+        query = self.query_conv(x).view(batch_size, -1, H * W).permute(0, 2, 1)  # (B, H*W, C')  (1, 1024, 64)
+        key = self.key_conv(y).view(batch_size, -1, H * W)  # (B, C', H*W)                       (1, 64, 1024)
+        value1 = self.value_conv1(x).view(batch_size, -1, H * W)  # (B, C, H*W)                  (1, 512, 32*32)
+        value2 = self.value_conv2(y).view(batch_size, -1, H * W)  # (B, C, H*W)                  (1, 512, 32*32)
+
+
+        # Calculate attention
+        attention = torch.bmm(query, key)  # (B, H*W, H*W)
+        attention = F.softmax(attention, dim=-1)
+
+        # Apply attention to both values
+        out1 = torch.bmm(value1, attention.permute(0, 2, 1))  # (B, C, H*W)
+        out2 = torch.bmm(value2, attention)  # (B, C, H*W)
+
+        # Reshape outputs
+        out1 = out1.view(batch_size, C, H, W)
+        out2 = out2.view(batch_size, C, H, W)
+
+        # Apply gamma and add residual connection
+        out1 = self.gamma1 * out1 + x
+        out2 = self.gamma2 * out2 + y
+
+        return out1, out2
 
 
 class FeatureExtractor(nn.Module):
@@ -232,7 +339,8 @@ class FewShotSeg(nn.Module):
 
         # myself blocks
         self.scaler = 20.0
-        self.weighting = Weighting()
+        self.weighting = Weighting()  
+        self.weighting_old = Weighting_old()
 
         self.learnThreshold_a = nn.Sequential(
             nn.Conv2d(512, 2048, kernel_size=3, stride=2, padding=1),
@@ -248,6 +356,10 @@ class FewShotSeg(nn.Module):
         self.innerProtoFusion = innerProtoFusion()  
 
         self.criterion = nn.NLLLoss(ignore_index=255, weight=torch.FloatTensor([0.1, 1.0]).cuda())
+
+        # self.matching = Matching(list(reversed(nbottlenecks[-3:])))
+
+
 
     def forward(self, supp_imgs, supp_mask, qry_imgs, qry_mask, prompt, train=False):
 
@@ -278,50 +390,74 @@ class FewShotSeg(nn.Module):
             # query_feats: (n-1) x (1, 512, 32 or 16, 32 or 16)   query_final_feats: (1, 512, 8, 8)
             support_feats = self.extract_feats(support_img, self.backbone, self.feat_ids, self.bottleneck_ids, self.lids)
             # support_feats: (n-1) x (1, 512, 32 or 16, 32 or 16)  support_final_feats: (1, 512, 8, 8)
+
+            # support_feats = self.mask_feature(support_feats, support_mask.clone())
+            # corr = Correlation.multilayer_correlation(query_feats, support_feats, self.stack_ids)
         
         num_inner_layer = len(self.feat_ids)
         # inner features  
         middle_prototypes = []
+
+        ################################### Support-query features re-weighting ##################################
+        spt_fts, qry_fts = support_feats[num_inner_layer - 1], query_feats[num_inner_layer - 1]
+        spt_hidden_fts, qry_hidden_fts = support_feats[:-1], query_feats[:-1]
+        spt_weighted_fts, qry_weighted_fts = self.weighting(spt_fts, qry_fts, spt_hidden_fts, qry_hidden_fts)
+
+        
+
+
+        
         for idx in range(num_inner_layer): 
 
             qry_fts_inner, spt_fts_inner = query_feats[idx], support_feats[idx]
-            weighted_inner_ft_qry, weighted_inner_ft_spt  = self.weighting(qry_fts_inner, spt_fts_inner)
+
+
+            ############################### Intermediate Information Extraction ################################
+            weighted_inner_ft_qry, weighted_inner_ft_spt  = self.weighting_old(qry_fts_inner, spt_fts_inner)
             # add semantic information and coarse prediction calculation
             coarse_pred = self.coarse_prediction(weighted_inner_ft_spt, weighted_inner_ft_qry, support_mask.clone())
             # middle prototype calculation
             middle_prototype = self.middle_information(support_mask.clone(), coarse_pred.clone(), weighted_inner_ft_spt, weighted_inner_ft_qry)
             
-            if train:
-                # loss for support image 
-                t_spt = self.learnThreshold_a(support_feats[num_inner_layer - 1])
-                t_spt = torch.flatten(t_spt, 1)
-                t_spt = self.learnThreshold_b(t_spt)
-                sim_spt = -F.cosine_similarity(support_feats[num_inner_layer - 1], middle_prototype[..., None, None], dim=1) * self.scaler
-                pred_spt = 1.0 - torch.sigmoid(0.5 * (sim_spt - t_spt))
-                pred_spt = pred_spt.unsqueeze(0)
-                pred_spt = F.interpolate(pred_spt, size=img_size, mode='bilinear', align_corners=True)
-                pred_spt = torch.cat((1.0 - pred_spt, pred_spt), dim=1)
+            # if train:
+            #     # loss for support image 
+            #     t_spt = self.learnThreshold_a(support_feats[num_inner_layer - 1])
+            #     t_spt = torch.flatten(t_spt, 1)
+            #     t_spt = self.learnThreshold_b(t_spt)
+            #     sim_spt = -F.cosine_similarity(support_feats[num_inner_layer - 1], middle_prototype[..., None, None], dim=1) * self.scaler
+            #     pred_spt = 1.0 - torch.sigmoid(0.5 * (sim_spt - t_spt))
+            #     pred_spt = pred_spt.unsqueeze(0)
+            #     pred_spt = F.interpolate(pred_spt, size=img_size, mode='bilinear', align_corners=True)
+            #     pred_spt = torch.cat((1.0 - pred_spt, pred_spt), dim=1)
 
-                loss_spt_middle = self.CE_loss(pred_spt, support_mask.clone())
+            #     loss_spt_middle = self.CE_loss(pred_spt, support_mask.clone())
 
-                # loss for query image
-                t_qry = self.learnThreshold_a(query_feats[num_inner_layer - 1])
-                t_qry = torch.flatten(t_qry, 1)
-                t_qry = self.learnThreshold_b(t_qry)
-                sim_qry = -F.cosine_similarity(query_feats[num_inner_layer - 1], middle_prototype[..., None, None], dim=1) * self.scaler
-                pred_qry = 1.0 - torch.sigmoid(0.5 * (sim_qry - t_qry))
-                pred_qry = pred_qry.unsqueeze(0)
-                pred_qry = F.interpolate(pred_qry, size=img_size, mode='bilinear', align_corners=True)
-                pred_qry = torch.cat((1.0 - pred_qry, pred_qry), dim=1)
+            #     # loss for query image
+            #     t_qry = self.learnThreshold_a(query_feats[num_inner_layer - 1])
+            #     t_qry = torch.flatten(t_qry, 1)
+            #     t_qry = self.learnThreshold_b(t_qry)
+            #     sim_qry = -F.cosine_similarity(query_feats[num_inner_layer - 1], middle_prototype[..., None, None], dim=1) * self.scaler
+            #     pred_qry = 1.0 - torch.sigmoid(0.5 * (sim_qry - t_qry))
+            #     pred_qry = pred_qry.unsqueeze(0)
+            #     pred_qry = F.interpolate(pred_qry, size=img_size, mode='bilinear', align_corners=True)
+            #     pred_qry = torch.cat((1.0 - pred_qry, pred_qry), dim=1)
 
-                loss_qry_middle = self.CE_loss(pred_qry, query_mask.clone())
+            #     loss_qry_middle = self.CE_loss(pred_qry, query_mask.clone())
 
             middle_prototypes.append(middle_prototype)
+            ##############################################################################################
         
+        
+        
+        ##################################### Similarity Calculation ####################################### 
         support_feats = self.mask_feature(support_feats, support_mask.clone())
         corr = Correlation.multilayer_correlation_new(query_feats, support_feats, self.stack_ids, middle_prototypes)
+        #####################################################################################################
 
+ 
+        ########################################## Decoder #########################################
         logit_mask = self.hpn_learner(corr)
+        ################################################################################################
 
         if not self.use_original_imgsize:
             logit_mask = F.interpolate(logit_mask, size=img_size, mode='bilinear', align_corners=True)
@@ -387,7 +523,6 @@ class FewShotSeg(nn.Module):
 
                     sorted_fts, indices = torch.sort(channel_fts, dim=-1)
                     indices = indices.unsqueeze(1)  # (B, 1, H*W)
-
 
                     sorted_weights = torch.gather(pred_flat, -1, indices)
                 
@@ -488,11 +623,5 @@ class FewShotSeg(nn.Module):
         loss = self.criterion(torch.log(torch.clamp(pred, torch.finfo(torch.float32).eps,
                                         1 - torch.finfo(torch.float32).eps)), label)
         return loss
-
-
-
-
-
-
 
 
