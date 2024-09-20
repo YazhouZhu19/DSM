@@ -178,44 +178,7 @@ class innerProtoFusion(nn.Module):
         return fused_feature
 
 
-class Weighting(nn.Module):
-    def __init__(self, in_channels=512):
-        super(Weighting, self).__init__()
-        self.in_channels = in_channels
-        self.query_conv = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
-        self.key_conv = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
-        self.value_conv1 = nn.Conv2d(in_channels, in_channels, kernel_size=1)
-        self.value_conv2 = nn.Conv2d(in_channels, in_channels, kernel_size=1)
-        self.gamma1 = nn.Parameter(torch.zeros(1))
-        self.gamma2 = nn.Parameter(torch.zeros(1))
-
-    def forward(self, x, y):
-        # x, y: (batch_size, in_channels, H, W)
-        batch_size, C, H, W = x.size()
-
-        # Compute Query, Key, and Values
-        query = self.query_conv(x).view(batch_size, -1, H * W).permute(0, 2, 1)  # (B, H*W, C')
-        key = self.key_conv(y).view(batch_size, -1, H * W)  # (B, C', H*W)
-        value1 = self.value_conv1(x).view(batch_size, -1, H * W)  # (B, C, H*W)
-        value2 = self.value_conv2(y).view(batch_size, -1, H * W)  # (B, C, H*W)
-
-        # Calculate attention
-        attention = torch.bmm(query, key)  # (B, H*W, H*W)
-        attention = F.softmax(attention, dim=-1)
-
-        # Apply attention to both values
-        out1 = torch.bmm(value1, attention.permute(0, 2, 1))  # (B, C, H*W)
-        out2 = torch.bmm(value2, attention)  # (B, C, H*W)
-
-        # Reshape outputs
-        out1 = out1.view(batch_size, C, H, W)
-        out2 = out2.view(batch_size, C, H, W)
-
-        # Apply gamma and add residual connection
-        out1 = self.gamma1 * out1 + x
-        out2 = self.gamma2 * out2 + y
-
-        return out1, out2
+class Weighting
 
 
 class FeatureExtractor(nn.Module):
