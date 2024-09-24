@@ -1,76 +1,371 @@
 """
 encoder resnet50, GNN geometrical feature extractor, feature transform operation
 """
-import random
-
+from re import A
+from tkinter import W
 import numpy as np
 import cv2
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .encoder_1 import Res50Encoder
-from .detection_head import *
+from torch.nn.parameter import Parameter
+from .encoder import Res50Encoder
+from .clip_encoders import *
+from .decoders import *
 
 
+from functools import reduce
+from operator import add
+from torchvision.models import resnet
+from torchvision.models import vgg
+import torchvision.models as models
+from .base.feature import extract_feat_vgg, extract_feat_res
+from .base.correlation import Correlation
+from .learner import MixedLearner
+# from .learner import Matching
+import matplotlib.pyplot as plt
 
-class ChannelAttention(nn.Module):
 
-    def __init__(self, in_channels, reduction_ratio=16):
-        super(ChannelAttention, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool1d(1)
-        self.fc = nn.Sequential(
-            nn.Linear(in_channels, in_channels // reduction_ratio, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(in_channels // reduction_ratio, in_channels, bias=False),
-            nn.Sigmoid()
-        )
+def visualize_segmentation_tensor(tensor):
+    # Ensure the tensor is on CPU and detach from computation graph
+    tensor = tensor.cpu().detach()
+
+    # Squeeze the batch dimension
+    tensor = tensor.squeeze(0)
+
+    # Get the predicted class for each pixel (argmax along channel dimension)
+    predicted_mask = torch.argmax(tensor, dim=0).numpy()
+
+    # Create a color map: 0 -> black, 1 -> white
+    cmap = plt.cm.gray
+
+    # Create the plot
+    plt.figure(figsize=(10, 10))
+    plt.imshow(predicted_mask, cmap=cmap, interpolation='nearest')
+    plt.colorbar()
+    plt.title("Segmentation Mask")
+    plt.axis('off')
+    plt.show()
+
+
+class AttentionFusion(nn.Module):
+    def __init__(self, input_dim, attention_type='self', num_heads=8):
+        super().__init__()
+        self.input_dim = input_dim
+        self.attention_type = attention_type
+        
+        if attention_type == 'self':
+            self.attention = SelfAttention(input_dim)
+        elif attention_type == 'cross':
+            self.attention = CrossAttention(input_dim)
+        elif attention_type == 'additive':
+            self.attention = AdditiveAttention(input_dim)
+        elif attention_type == 'dot_product':
+            self.attention = DotProductAttention(input_dim)
+        elif attention_type == 'multi_head':
+            self.attention = MultiHeadAttention(input_dim, num_heads)
+        else:
+            raise ValueError(f"Unsupported attention type: {attention_type}")
+        
+        self.output_layer = nn.Linear(input_dim, input_dim)
+        
+    def forward(self, x1, x2):
+        if self.attention_type in ['self', 'multi_head']:
+            x = torch.cat([x1, x2], dim=1)  # (batch_size, 2, input_dim)
+            attention_output = self.attention(x)
+            # 对 attention_output 进行平均池化
+            attention_output = attention_output.mean(dim=1, keepdim=True)  # (batch_size, 1, input_dim)
+        else:
+            attention_output = self.attention(x1, x2)  # 已经是 (batch_size, 1, input_dim)
+        
+        output = self.output_layer(attention_output)
+        return output  # (batch_size, 1, input_dim)
+
+class SelfAttention(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.query = nn.Linear(dim, dim)
+        self.key = nn.Linear(dim, dim)
+        self.value = nn.Linear(dim, dim)
+        
+    def forward(self, x):
+        q = self.query(x)
+        k = self.key(x)
+        v = self.value(x)
+        
+        scores = torch.matmul(q, k.transpose(-2, -1)) / (self.query.out_features ** 0.5)
+        attn = F.softmax(scores, dim=-1)
+        return torch.matmul(attn, v)
+
+class CrossAttention(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.query = nn.Linear(dim, dim)
+        self.key = nn.Linear(dim, dim)
+        self.value = nn.Linear(dim, dim)
+        
+    def forward(self, x1, x2):
+        q = self.query(x1)
+        k = self.key(x2)
+        v = self.value(x2)
+        
+        scores = torch.matmul(q, k.transpose(-2, -1)) / (self.query.out_features ** 0.5)
+        attn = F.softmax(scores, dim=-1)
+        return torch.matmul(attn, v)
+
+class AdditiveAttention(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.query = nn.Linear(dim, dim)
+        self.key = nn.Linear(dim, dim)
+        self.v = nn.Linear(dim, 1)
+        
+    def forward(self, x1, x2):
+        q = self.query(x1)
+        k = self.key(x2)
+        energy = self.v(torch.tanh(q + k))
+        attention = F.softmax(energy, dim=1)
+        return (attention * x2)
+
+class DotProductAttention(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.scale = dim ** -0.5
+        
+    def forward(self, x1, x2):
+        dot = torch.matmul(x1, x2.transpose(-2, -1)) * self.scale
+        attention = F.softmax(dot, dim=-1)
+        return torch.matmul(attention, x2)
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, dim, heads=8):
+        super().__init__()
+        self.heads = heads
+        self.scale = (dim // heads) ** -0.5
+        self.to_qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.to_out = nn.Linear(dim, dim)
 
     def forward(self, x):
-        b, c = x.size()
-        y = self.avg_pool(x.unsqueeze(-1)).view(b, c)
-        y = self.fc(y).view(b, c)
-        return x * y
+        qkv = self.to_qkv(x).chunk(3, dim=-1)
+        q, k, v = map(lambda t: t.view(t.shape[0], -1, self.heads, t.shape[-1] // self.heads).transpose(1, 2), qkv)
+        dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+        attn = dots.softmax(dim=-1)
+        out = torch.matmul(attn, v)
+        out = out.transpose(1, 2).reshape(out.shape[0], -1, out.shape[-1] * self.heads)
+        return self.to_out(out)
 
+class innerProtoFusion(nn.Module):
+    def __init__(self, feature_dim=512):
+        super().__init__()
+        self.query = nn.Linear(feature_dim, feature_dim)
+        self.key = nn.Linear(feature_dim, feature_dim)
+        self.value = nn.Linear(feature_dim, feature_dim)
+        
+    def forward(self, prototypes):
+        # prototypes shape: (n, 1, 512)
+        n = prototypes.size(0)
+        
+        # Compute query, key, and value
+        q = self.query(prototypes)  # (n, 1, 512)
+        k = self.key(prototypes)    # (n, 1, 512)
+        v = self.value(prototypes)  # (n, 1, 512)
+        
+        # Compute attention weights
+        attn_weights = torch.bmm(q, k.transpose(1, 2))  # (n, 1, 1)
+        attn_weights = torch.softmax(attn_weights, dim=0)  # (n, 1, 1)
+        
+        # Weighted sum
+        fused_feature = torch.sum(attn_weights * v, dim=0)  # (1, 512)
+        
+        return fused_feature
+
+class Weighting(nn.Module):
+    def __init__(self, in_channels=512, max_hidden_layers=10):
+        super(Weighting, self).__init__()
+        self.in_channels = in_channels
+        self.max_hidden_layers = max_hidden_layers
+        
+        # Original convolutional layers
+        self.query_conv = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
+        self.key_conv = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
+        self.value_conv1 = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+        self.value_conv2 = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+        
+        # Learnable weights for combining hidden features
+        self.hidden_weights1 = nn.Parameter(torch.ones(max_hidden_layers))
+        self.hidden_weights2 = nn.Parameter(torch.ones(max_hidden_layers))
+        
+        # Layers for gamma generation
+        self.gamma_gen1 = nn.Sequential(
+            nn.Linear(in_channels, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        )
+        self.gamma_gen2 = nn.Sequential(
+            nn.Linear(in_channels, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        )
+
+    def forward(self, x, y, x_hidden, y_hidden):
+        batch_size, C, H, W = x.size()
+
+        # Compute Query, Key, and Values
+        query = self.query_conv(x).view(batch_size, -1, H * W).permute(0, 2, 1)
+        key = self.key_conv(y).view(batch_size, -1, H * W)
+        value1 = self.value_conv1(x).view(batch_size, -1, H * W)
+        value2 = self.value_conv2(y).view(batch_size, -1, H * W)
+
+        # Calculate attention
+        attention = torch.bmm(query, key)
+        attention = F.softmax(attention, dim=-1)
+
+        # Apply attention to both values
+        out1 = torch.bmm(value1, attention.permute(0, 2, 1))
+        out2 = torch.bmm(value2, attention)
+
+        # Reshape outputs
+        out1 = out1.view(batch_size, C, H, W)
+        out2 = out2.view(batch_size, C, H, W)
+
+        # Combine hidden features with learnable weights
+        num_layers = min(len(x_hidden), self.max_hidden_layers)
+        x_weights = F.softmax(self.hidden_weights1[:num_layers], dim=0)
+        y_weights = F.softmax(self.hidden_weights2[:num_layers], dim=0)
+
+
+
+
+        
+        x_hidden_weighted = sum([w * h.mean(dim=[2, 3]) for w, h in zip(x_weights, x_hidden[:num_layers])])
+        y_hidden_weighted = sum([w * h.mean(dim=[2, 3]) for w, h in zip(y_weights, y_hidden[:num_layers])])
+
+        # Generate gammas using weighted hidden features
+        gamma1 = self.gamma_gen1(x_hidden_weighted).view(batch_size, 1, 1, 1)
+        gamma2 = self.gamma_gen2(y_hidden_weighted).view(batch_size, 1, 1, 1)
+
+        # Apply gamma and add residual connection
+        out1 = gamma1 * out1 + x
+        out2 = gamma2 * out2 + y
+
+        return out1, out2
+
+class Weighting_old(nn.Module):
+    def __init__(self, in_channels=512):
+        super(Weighting_old, self).__init__()
+        self.in_channels = in_channels
+        self.query_conv = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
+        self.key_conv = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
+        self.value_conv1 = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+        self.value_conv2 = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+        self.gamma1 = nn.Parameter(torch.zeros(1))
+        self.gamma2 = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x, y):
+        # x, y: (batch_size, in_channels, H, W)
+        batch_size, C, H, W = x.size()
+
+        # Compute Query, Key, and Values
+        query = self.query_conv(x).view(batch_size, -1, H * W).permute(0, 2, 1)  # (B, H*W, C')  (1, 1024, 64)
+        key = self.key_conv(y).view(batch_size, -1, H * W)  # (B, C', H*W)                       (1, 64, 1024)
+        value1 = self.value_conv1(x).view(batch_size, -1, H * W)  # (B, C, H*W)                  (1, 512, 32*32)
+        value2 = self.value_conv2(y).view(batch_size, -1, H * W)  # (B, C, H*W)                  (1, 512, 32*32)
+
+
+        # Calculate attention
+        attention = torch.bmm(query, key)  # (B, H*W, H*W)
+        attention = F.softmax(attention, dim=-1)
+
+        # Apply attention to both values
+        out1 = torch.bmm(value1, attention.permute(0, 2, 1))  # (B, C, H*W)
+        out2 = torch.bmm(value2, attention)  # (B, C, H*W)
+
+        # Reshape outputs
+        out1 = out1.view(batch_size, C, H, W)
+        out2 = out2.view(batch_size, C, H, W)
+
+        # Apply gamma and add residual connection
+        out1 = self.gamma1 * out1 + x
+        out2 = self.gamma2 * out2 + y
+
+        return out1, out2
+
+
+class FeatureExtractor(nn.Module):
+    def __init__(self):
+        super(FeatureExtractor, self).__init__()
+        resnet = models.resnet18(pretrained=True)
+        self.features = nn.Sequential(*list(resnet.children())[:-2])
+    
+    def forward(self, x):
+        return self.features(x)
 
 
 class FewShotSeg(nn.Module):
 
-    def __init__(self, args):
+    def __init__(self, args, backbone, use_original_imgsize):
         super().__init__()
 
-        # Encoder
-        self.encoder = Res50Encoder(replace_stride_with_dilation=[True, True, False],
-                                    pretrained_weights="COCO")  # or "ImageNet"
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
         else:
             self.device = torch.device("cpu")
 
-        self.scaler = 20.0
-        self.args = args
-        self.reference_layer1 = nn.Linear(512, 2, bias=True)
-        self.epsilon_list = [0.01, 0.03, 0.05, 0.001, 0.003, 0.005]
-        self.fg_sampler = np.random.RandomState(1289)
+        # 1. Backbone network initialization
+        self.backbone_type = backbone
+        self.use_original_imgsize = use_original_imgsize
 
+        if backbone == 'vgg16':
+            self.backbone = vgg.vgg16(pretrained=True)
+            self.feat_ids = [17, 19, 21, 24, 26, 28, 30]
+            self.extract_feats = extract_feat_vgg
+            nbottlenecks = [2, 2, 3, 3, 3, 1]
+        elif backbone == 'resnet50':
+            self.backbone = resnet.resnet50(pretrained=True)
+            self.feat_ids = list(range(4, 17))
+            self.extract_feats = extract_feat_res
+            nbottlenecks = [3, 4, 6, 3]
+        elif backbone == 'resnet101':
+            self.backbone = resnet.resnet101(pretrained=True)
+            self.feat_ids = list(range(4, 34))
+            self.extract_feats = extract_feat_res
+            nbottlenecks = [3, 4, 23, 3]
+        else:
+            raise Exception('Unavailable backbone: %s' % backbone)
+
+        self.bottleneck_ids = reduce(add, list(map(lambda x: list(range(x)), nbottlenecks)))
+        self.lids = reduce(add, [[i + 1] * x for i, x in enumerate(nbottlenecks)])
+        self.stack_ids = torch.tensor(self.lids).bincount().__reversed__().cumsum(dim=0)[:3]
+        self.backbone.eval()
+        self.hpn_learner = MixedLearner(list(reversed(nbottlenecks[-3:])))
+        self.cross_entropy_loss = nn.CrossEntropyLoss()
+
+        # myself blocks
+        self.scaler = 20.0
+        self.weighting = Weighting()  
+        self.weighting_old = Weighting_old()
+
+        self.learnThreshold_a = nn.Sequential(
+            nn.Conv2d(512, 2048, kernel_size=3, stride=2, padding=1),
+            nn.AdaptiveAvgPool2d((1, 1))
+        )
+        self.learnThreshold_b = nn.Sequential(
+            nn.Linear(2048, 1000),
+            nn.Linear(in_features=1000, out_features=1, bias=True)
+        )
+
+        # attention_types = ['self', 'cross', 'additive', 'dot_product', 'multi_head']
+        self.middle_fusion = AttentionFusion(input_dim=512, attention_type='cross')
+        self.innerProtoFusion = innerProtoFusion()  
 
         self.criterion = nn.NLLLoss(ignore_index=255, weight=torch.FloatTensor([0.1, 1.0]).cuda())
-        self.margin = 0.
 
-        self.channel = nn.Conv2d(in_channels=507, out_channels=512, kernel_size=1, stride=1)
-        self.mse_loss = nn.MSELoss()
-
-        # self.function_layer = nn.Conv2d(in_channels=1024, out_channels=512, kernel_size=1, stride=1)  # the f function
-        self.function_layer = nn.Linear(1024, 512)  # the f function 
-        self.att = ChannelAttention(in_channels=512)
-
-        self.sampling_reshape_1 = nn.Linear(256, 512)
-        self.sampling_reshape_2 = nn.Linear(128, 512)
-        self.sampling_reshape_3 = nn.Linear(64, 512)
+        # self.matching = Matching(list(reversed(nbottlenecks[-3:])))
 
 
 
-    def forward(self, supp_imgs, supp_mask, qry_imgs, qry_mask, opt, train=False):
+    def forward(self, supp_imgs, supp_mask, qry_imgs, qry_mask, prompt, train=False):
 
         """
         Args:
@@ -81,511 +376,256 @@ class FewShotSeg(nn.Module):
             back_mask: background masks for support images
                 way x shot x [B x H x W], list of lists of tensors
             qry_imgs: query images
-                N x [B x 3 x H x W], list of tensors  (1, 3, 257, 257)
-            qry_mask: label
-                N x 2 x H x W, tensor
+                N x [B x 3 x H x W], list of tensors
         """
 
-        self.n_ways = len(supp_imgs)
-        self.n_shots = len(supp_imgs[0])
-        self.n_queries = len(qry_imgs)
-        assert self.n_ways == 1  # for now only one-way, because not every shot has multiple sub-images
-        assert self.n_queries == 1
+        query_img = qry_imgs[0]
+        support_img = supp_imgs[0][0]
+        support_mask = supp_mask[0][0]
+        query_mask = qry_mask
 
-        qry_bs = qry_imgs[0].shape[0]
-        supp_bs = supp_imgs[0][0].shape[0]
         img_size = supp_imgs[0][0].shape[-2:]
+        loss_spt_middle = torch.zeros(1).to(self.device)
+        loss_qry_middle = torch.zeros(1).to(self.device)
 
-        supp_mask = torch.stack([torch.stack(way, dim=0) for way in supp_mask],
-                                dim=0).view(supp_bs, self.n_ways, self.n_shots, *img_size)  # B x Wa x Sh x H x W
-        ## Feature Extracting With ResNet Backbone
-        # # Extract features #
-        imgs_concat = torch.cat([torch.cat(way, dim=0) for way in supp_imgs]
-                                + [torch.cat(qry_imgs, dim=0), ], dim=0)
+        with torch.no_grad():
 
-        img_fts, tao = self.encoder(imgs_concat)
+            query_feats = self.extract_feats(query_img, self.backbone, self.feat_ids, self.bottleneck_ids, self.lids)
+            # query_feats: (n-1) x (1, 512, 32 or 16, 32 or 16)   query_final_feats: (1, 512, 8, 8)
+            support_feats = self.extract_feats(support_img, self.backbone, self.feat_ids, self.bottleneck_ids, self.lids)
+            # support_feats: (n-1) x (1, 512, 32 or 16, 32 or 16)  support_final_feats: (1, 512, 8, 8)
 
-        supp_fts = img_fts[:self.n_ways * self.n_shots * supp_bs].view(  # B x Wa x Sh x C x H' x W'
-            supp_bs, self.n_ways, self.n_shots, -1, *img_fts.shape[-2:])
-        qry_fts = img_fts[self.n_ways * self.n_shots * supp_bs:].view(  # B x N x C x H' x W'
-            qry_bs, self.n_queries, -1, *img_fts.shape[-2:])
+            # support_feats = self.mask_feature(support_feats, support_mask.clone())
+            # corr = Correlation.multilayer_correlation(query_feats, support_feats, self.stack_ids)
+        
+        num_inner_layer = len(self.feat_ids)
+        # inner features  
+        middle_prototypes = []
 
-        # Get threshold #
-        self.t = tao[self.n_ways * self.n_shots * supp_bs:]  # t for query features
-        self.thresh_pred = [self.t for _ in range(self.n_ways)]
+        ################################### Support-query features re-weighting ##################################
+        spt_fts, qry_fts = support_feats[num_inner_layer - 1], query_feats[num_inner_layer - 1]
+        spt_hidden_fts, qry_hidden_fts = support_feats[:-1], query_feats[:-1]
+        spt_weighted_fts, qry_weighted_fts = self.weighting(spt_fts, qry_fts, spt_hidden_fts, qry_hidden_fts)
 
-        self.t_ = tao[:self.n_ways * self.n_shots * supp_bs]  # t for support features
-        self.thresh_pred_ = [self.t_ for _ in range(self.n_ways)]
+        
 
-        outputs_qry = []
-        loss_wt_spt_1 = torch.zeros(1).to(self.device)
-        loss_wt_qry_1 = torch.zeros(1).to(self.device)
-        loss_wt_spt_2 = torch.zeros(1).to(self.device)
-        loss_wt_qry_2 = torch.zeros(1).to(self.device)
-        for epi in range(supp_bs):
 
-            if supp_mask[[0], 0, 0].max() > 0.:
+        
+        for idx in range(num_inner_layer): 
 
-                spt_fts_ = [[self.getFeatures(supp_fts[[epi], way, shot], supp_mask[[epi], way, shot])
-                             for shot in range(self.n_shots)] for way in range(self.n_ways)]
-                spt_fg_proto = self.getPrototype(spt_fts_)
+            qry_fts_inner, spt_fts_inner = query_feats[idx], support_feats[idx]
 
-                supp_fts_b = [[self.getFeatures(supp_fts[[epi], way, shot], 1. - supp_mask[[epi], way, shot])
-                               for shot in range(self.n_shots)] for way in range(self.n_ways)]
-                spt_bg_proto = self.getPrototype(supp_fts_b)
 
-                qry_pred = torch.stack(
-                        [self.getPred(qry_fts[way], spt_fg_proto[way], self.thresh_pred[way])
-                         for way in range(self.n_ways)], dim=1)  # N x Wa x H' x W'
-                qry_pred_coarse = F.interpolate(qry_pred, size=img_size, mode='bilinear', align_corners=True)
-                qry_fts_ = [[self.getFeatures(qry_fts[way], qry_pred_coarse[epi]) for way in range(self.n_ways)]]
-                qry_fg_proto = self.getPrototype(qry_fts_)
-
-                if train:
-
-                    # ******************** perturbation signal formulation **************** #
-                    # signal a
-                    spt_fg_proto_learnable_a = [torch.nn.Parameter(spt_fg_proto[way]) for way in range(self.n_ways)]
-                    spt_fg_proto_learnable_a = [spt_fg_proto_learnable_a[way].requires_grad_() for way in
-                                                range(self.n_ways)]
-                    intra_class_loss = self.mse_loss(spt_fg_proto_learnable_a[0], qry_fg_proto[0])
-
-                    # signal b
-                    spt_fg_proto_learnable_b = [torch.nn.Parameter(spt_fg_proto[way]) for way in range(self.n_ways)]
-                    spt_fg_proto_learnable_b = [spt_fg_proto_learnable_b[way].requires_grad_() for way in
-                                                range(self.n_ways)]
-                    bg_prototypes = [[self.compute_multiple_background_prototypes(
-                        5, supp_fts[[epi], way, shot], supp_mask[[epi], way, shot], self.fg_sampler)
-                        for shot in range(self.n_shots)] for way in range(self.n_ways)]
-                    inter_class_loss = self.infoNCE(qry_fg_proto[0], spt_fg_proto_learnable_b[0],
-                                                    bg_prototypes[0][0][0])
-                    opt.zero_grad()
-                    intra_class_loss.backward(retain_graph=True)
-                    inter_class_loss.backward(retain_graph=True)
-
-                    grad_spt_fg_proto_learnable_a = [spt_fg_proto_learnable_a[way].grad.detach() for way in
-                                                     range(self.n_ways)]
-                    grad_spt_fg_proto_learnable_b = [spt_fg_proto_learnable_b[way].grad.detach() for way in
-                                                     range(self.n_ways)]
-                    # ******************************************************************* #
-
-                    # ************************ Two-stage Attack ************************* #
-                    # index = torch.randint(0, len(self.epsilon_list), (1,))[0]
-                    # epsilon = self.epsilon_list[index]
-                    selected_values = random.choices(self.epsilon_list, k=512)
-                    epsilon = torch.tensor(selected_values, dtype=torch.float32).unsqueeze(0).to(self.device)
-
-                    # *** the first stage attack *** #
-                    adv_spt_fg_proto = [self.fgsm_attack(spt_fg_proto[way], epsilon,
-                                                         grad_spt_fg_proto_learnable_a[way],
-                                                         grad_spt_fg_proto_learnable_b[way])
-                                        for way in range(self.n_ways)]
-                    adv_qry_fg_proto = [self.fgsm_attack(qry_fg_proto[way], epsilon,
-                                                         grad_spt_fg_proto_learnable_a[way],
-                                                         grad_spt_fg_proto_learnable_b[way])
-                                        for way in range(self.n_ways)]
-                    # the first stage whitening
-                    loss_wt_spt_1 = self.Whitening(adv_spt_fg_proto[0], spt_fg_proto[0])
-                    loss_wt_qry_1 = self.Whitening(adv_qry_fg_proto[0], qry_fg_proto[0])
+            ############################### Intermediate Information Extraction ################################
+            weighted_inner_ft_qry, weighted_inner_ft_spt  = self.weighting_old(qry_fts_inner, spt_fts_inner)
+            # add semantic information and coarse prediction calculation
+            coarse_pred = self.coarse_prediction(weighted_inner_ft_spt, weighted_inner_ft_qry, support_mask.clone())
+            # middle prototype calculation
+            middle_prototype = self.middle_information(support_mask.clone(), coarse_pred.clone(), weighted_inner_ft_spt, weighted_inner_ft_qry)
             
-                    fg_proto_inter = [torch.cat([adv_spt_fg_proto[way], adv_qry_fg_proto[way]], dim=1)
-                                      for way in range(self.n_ways)]
-                    fg_proto_inter = [self.function_layer(fg_proto_inter[way]) for way in range(self.n_ways)]
-                    proto_first = [self.att(fg_proto_inter[way]) for way in range(self.n_ways)]
-                    
-                    proto_sampling_1 = [proto_first[way][:, torch.randperm(512)[:256]] for way in range(self.n_ways)]
-                    proto_sampling_1 = [self.sampling_reshape_1(proto_sampling_1[way]) for way in range(self.n_ways)]
-                
-                    proto_sampling_2 = [proto_first[way][:, torch.randperm(512)[:128]] for way in range(self.n_ways)]
-                    proto_sampling_2 = [self.sampling_reshape_2(proto_sampling_2[way]) for way in range(self.n_ways)]
+            # if train:
+            #     # loss for support image 
+            #     t_spt = self.learnThreshold_a(support_feats[num_inner_layer - 1])
+            #     t_spt = torch.flatten(t_spt, 1)
+            #     t_spt = self.learnThreshold_b(t_spt)
+            #     sim_spt = -F.cosine_similarity(support_feats[num_inner_layer - 1], middle_prototype[..., None, None], dim=1) * self.scaler
+            #     pred_spt = 1.0 - torch.sigmoid(0.5 * (sim_spt - t_spt))
+            #     pred_spt = pred_spt.unsqueeze(0)
+            #     pred_spt = F.interpolate(pred_spt, size=img_size, mode='bilinear', align_corners=True)
+            #     pred_spt = torch.cat((1.0 - pred_spt, pred_spt), dim=1)
 
-                    proto_sampling_3 = [proto_first[way][:, torch.randperm(512)[:64]] for way in range(self.n_ways)]
-                    proto_sampling_3 = [self.sampling_reshape_3(proto_sampling_3[way]) for way in range(self.n_ways)]
-       
-                    
-                    # *** the second stage attack *** #
-                    adv_sampling_proto_1 = [self.fgsm_attack(proto_sampling_1[way], epsilon,
-                                                         grad_spt_fg_proto_learnable_a[way],
-                                                         grad_spt_fg_proto_learnable_b[way])
-                                        for way in range(self.n_ways)]
-                    adv_sampling_proto_2 = [self.fgsm_attack(proto_sampling_2[way], epsilon,
-                                                         grad_spt_fg_proto_learnable_a[way],
-                                                         grad_spt_fg_proto_learnable_b[way])
-                                        for way in range(self.n_ways)]
-                    adv_sampling_proto_3 = [self.fgsm_attack(proto_sampling_3[way], epsilon,
-                                                         grad_spt_fg_proto_learnable_a[way],
-                                                         grad_spt_fg_proto_learnable_b[way])
-                                        for way in range(self.n_ways)]
-                    
-                    adv_spt_proto_two_1 = [torch.cat((adv_spt_fg_proto[way], adv_sampling_proto_1[way]), dim=1) for way in range(self.n_ways)] 
-                    adv_spt_proto_two_1 = [self.function_layer(adv_spt_proto_two_1[way]) for way in range(self.n_ways)]
-                    adv_spt_proto_two_2 = [torch.cat((adv_spt_fg_proto[way], adv_sampling_proto_2[way]), dim=1) for way in range(self.n_ways)] 
-                    adv_spt_proto_two_2 = [self.function_layer(adv_spt_proto_two_2[way]) for way in range(self.n_ways)]
-                    adv_spt_proto_two_3 = [torch.cat((adv_spt_fg_proto[way], adv_sampling_proto_3[way]), dim=1) for way in range(self.n_ways)]
-                    adv_spt_proto_two_3 = [self.function_layer(adv_spt_proto_two_3[way]) for way in range(self.n_ways)]
+            #     loss_spt_middle = self.CE_loss(pred_spt, support_mask.clone())
 
-                    proto_spt_inter_second = [(adv_spt_proto_two_1[way] + adv_spt_proto_two_2[way] + adv_spt_proto_two_3[way]) for way in range(self.n_ways)] 
-                    adv_spt_proto_second = [self.att(proto_spt_inter_second[way]) for way in range(self.n_ways)] 
+            #     # loss for query image
+            #     t_qry = self.learnThreshold_a(query_feats[num_inner_layer - 1])
+            #     t_qry = torch.flatten(t_qry, 1)
+            #     t_qry = self.learnThreshold_b(t_qry)
+            #     sim_qry = -F.cosine_similarity(query_feats[num_inner_layer - 1], middle_prototype[..., None, None], dim=1) * self.scaler
+            #     pred_qry = 1.0 - torch.sigmoid(0.5 * (sim_qry - t_qry))
+            #     pred_qry = pred_qry.unsqueeze(0)
+            #     pred_qry = F.interpolate(pred_qry, size=img_size, mode='bilinear', align_corners=True)
+            #     pred_qry = torch.cat((1.0 - pred_qry, pred_qry), dim=1)
 
-                    adv_qry_proto_two_1 = [torch.cat((adv_qry_fg_proto[way], adv_sampling_proto_1[way]), dim=1) for way in range(self.n_ways)]
-                    adv_qry_proto_two_1 = [self.function_layer(adv_qry_proto_two_1[way]) for way in range(self.n_ways)]
-                    adv_qry_proto_two_2 = [torch.cat((adv_qry_fg_proto[way], adv_sampling_proto_2[way]), dim=1) for way in range(self.n_ways)]
-                    adv_qry_proto_two_2 = [self.function_layer(adv_qry_proto_two_2[way]) for way in range(self.n_ways)]
-                    adv_qry_proto_two_3 = [torch.cat((adv_qry_fg_proto[way], adv_sampling_proto_3[way]), dim=1) for way in range(self.n_ways)]
-                    adv_qry_proto_two_3 = [self.function_layer(adv_qry_proto_two_3[way]) for way in range(self.n_ways)]
-                    
-                    proto_qry_inter_second = [(adv_qry_proto_two_1[way] + adv_qry_proto_two_2[way] + adv_qry_proto_two_3[way]) for way in range(self.n_ways)] 
-                    adv_qry_proto_second = [self.att(proto_qry_inter_second[way]) for way in range(self.n_ways)]
+            #     loss_qry_middle = self.CE_loss(pred_qry, query_mask.clone())
 
-                    # the second stage whitening
-                    loss_wt_spt_2 = self.Whitening(adv_spt_proto_second[0], spt_fg_proto[0])
-                    loss_wt_qry_2 = self.Whitening(adv_qry_proto_second[0], qry_fg_proto[0])
-                    
-                    proto_second_ = [torch.cat((adv_spt_proto_second[way], adv_qry_proto_second[way]), dim=1) for way in range(self.n_ways)]
-                    proto_second = [self.att(self.function_layer(proto_second_[way])) for way in range(self.n_ways)] 
+            middle_prototypes.append(middle_prototype)
+            ##############################################################################################
+        
+        
+        
+        ##################################### Similarity Calculation ####################################### 
+        support_feats = self.mask_feature(support_feats, support_mask.clone())
+        corr = Correlation.multilayer_correlation_new(query_feats, support_feats, self.stack_ids, middle_prototypes)
+        #####################################################################################################
 
-                    qry_pred = torch.stack([self.getPred(qry_fts[epi], proto_second[way], self.thresh_pred[way]) for way in range(self.n_ways)], dim=1)  # N x Wa x H' x W'
-                    qry_pred_up = F.interpolate(qry_pred, size=img_size, mode='bilinear', align_corners=True)
-                    preds = torch.cat((1.0 - qry_pred_up, qry_pred_up), dim=1)
-                    outputs_qry.append(preds)
+ 
+        ########################################## Decoder #########################################
+        logit_mask = self.hpn_learner(corr)
+        ################################################################################################
 
-                else:
-                    fg_proto_inter = [torch.cat([spt_fg_proto[way], qry_fg_proto[way]], dim=1)
-                                      for way in range(self.n_ways)]
-                    fg_proto_inter = [self.function_layer(fg_proto_inter[way]) for way in range(self.n_ways)]
-                    proto_first = [self.att(fg_proto_inter[way]) for way in range(self.n_ways)]
+        if not self.use_original_imgsize:
+            logit_mask = F.interpolate(logit_mask, size=img_size, mode='bilinear', align_corners=True)
 
-                    proto_sampling_1 = [proto_first[way][:, torch.randperm(512)[:256]] for way in range(self.n_ways)]
-                    proto_sampling_1 = [self.sampling_reshape_1(proto_sampling_1[way]) for way in range(self.n_ways)]
-                    proto_sampling_2 = [proto_first[way][:, torch.randperm(512)[:128]] for way in range(self.n_ways)]
-                    proto_sampling_2 = [self.sampling_reshape_2(proto_sampling_2[way]) for way in range(self.n_ways)]
-                    proto_sampling_3 = [proto_first[way][:, torch.randperm(512)[:64]] for way in range(self.n_ways)]
-                    proto_sampling_3 = [self.sampling_reshape_3(proto_sampling_3[way]) for way in range(self.n_ways)]
-
-                    spt_fg_proto_two_1 = [torch.cat((spt_fg_proto[way], proto_sampling_1[way]), dim=1) for way in range(self.n_ways)] 
-                    spt_fg_proto_two_1 = [self.function_layer(spt_fg_proto_two_1[way]) for way in range(self.n_ways)]
-                    spt_fg_proto_two_2 = [torch.cat((spt_fg_proto[way], proto_sampling_2[way]), dim=1) for way in range(self.n_ways)] 
-                    spt_fg_proto_two_2 = [self.function_layer(spt_fg_proto_two_2[way]) for way in range(self.n_ways)]
-                    spt_fg_proto_two_3 = [torch.cat((spt_fg_proto[way], proto_sampling_3[way]), dim=1) for way in range(self.n_ways)]
-                    spt_fg_proto_two_3 = [self.function_layer(spt_fg_proto_two_3[way]) for way in range(self.n_ways)]
-
-                    proto_spt_inter = [(spt_fg_proto_two_1[way] + spt_fg_proto_two_2[way] + spt_fg_proto_two_3[way]) for way in range(self.n_ways)] 
-                    proto_spt = [self.att(proto_spt_inter[way]) for way in range(self.n_ways)]
-
-                    qry_fg_proto_two_1 = [torch.cat((qry_fg_proto[way], proto_sampling_1[way]), dim=1) for way in range(self.n_ways)]
-                    qry_fg_proto_two_1 = [self.function_layer(qry_fg_proto_two_1[way]) for way in range(self.n_ways)]
-                    qry_fg_proto_two_2 = [torch.cat((qry_fg_proto[way], proto_sampling_2[way]), dim=1) for way in range(self.n_ways)]
-                    qry_fg_proto_two_2 = [self.function_layer(qry_fg_proto_two_2[way]) for way in range(self.n_ways)]
-                    qry_fg_proto_two_3 = [torch.cat((qry_fg_proto[way], proto_sampling_3[way]), dim=1) for way in range(self.n_ways)]
-                    qry_fg_proto_two_3 = [self.function_layer(qry_fg_proto_two_3[way]) for way in range(self.n_ways)]
-
-                    proto_qry_inter = [(qry_fg_proto_two_1[way] + qry_fg_proto_two_2[way] + qry_fg_proto_two_3[way]) for way in range(self.n_ways)] 
-                    proto_qry = [self.att(proto_qry_inter[way]) for way in range(self.n_ways)]
-
-                    proto = [torch.cat((proto_spt[way], proto_qry[way]), dim=1) for way in range(self.n_ways)]
-                    proto = [self.att(self.function_layer(proto[way])) for way in range(self.n_ways)] 
-
-                    qry_pred = torch.stack([self.getPred(qry_fts[epi], proto[way], self.thresh_pred[way]) for way in range(self.n_ways)], dim=1)
-                    qry_pred_up = F.interpolate(qry_pred, size=img_size, mode='bilinear', align_corners=True)
-                    preds = torch.cat((1.0 - qry_pred_up, qry_pred_up), dim=1)
-                    outputs_qry.append(preds)  
-                    
-                ########################################################################
-
-            else:
-                ########################acquiesce prototypical network#################
-                supp_fts_ = [[self.getFeatures(supp_fts[[epi], way, shot], supp_mask[[epi], way, shot])
-                              for shot in range(self.n_shots)] for way in range(self.n_ways)]
-                fg_prototypes = self.getPrototype(supp_fts_)  # the coarse foreground
-
-                qry_pred = torch.stack(
-                    [self.getPred(qry_fts[epi], fg_prototypes[way], self.thresh_pred[way])
-                     for way in range(self.n_ways)], dim=1)  # N x Wa x H' x W'
-                ########################################################################
-
-                # Combine predictions of different feature maps #
-                qry_pred_up = F.interpolate(qry_pred, size=img_size, mode='bilinear', align_corners=True)
-                preds = torch.cat((1.0 - qry_pred_up, qry_pred_up), dim=1)
-
-                outputs_qry.append(preds)
-
-        output_qry = torch.stack(outputs_qry, dim=1)
-        output_qry = output_qry.view(-1, *output_qry.shape[2:])
-
-        return output_qry, loss_wt_spt_1 / supp_bs, loss_wt_qry_1 / supp_bs, loss_wt_spt_2 / supp_bs, loss_wt_qry_2 / supp_bs
-
-    def getPred(self, fts, prototype, thresh):
+        return logit_mask, loss_spt_middle, loss_qry_middle
+    
+    
+    # designed functions
+    def masked(self, feature, mask):
+        
         """
-        Calculate the distance between features and prototypes
+        mask: (1, H, W)
+        feature: (1, C, h, w)
+        """
+        mask = F.interpolate(mask.unsqueeze(1).float(), feature.size()[2:], mode='bilinear', align_corners=True)
+        feature = feature * mask
 
-        Args:
-            fts: input features
-                expect shape: N x C x H x W
-            prototype: prototype of one semantic class
-                expect shape: 1 x C
+        return feature
+    
+    def coarse_prediction(self, spt_fts, qry_fts, mask): 
+        """
+        mask: (1, H, W)
+        spt_fts: (1, C, h, w)
+        qry_fts: (1, C, h, w)
         """
 
-        sim = -F.cosine_similarity(fts, prototype[..., None, None], dim=1) * self.scaler
-        pred = 1.0 - torch.sigmoid(0.5 * (sim - thresh))
+        fts = F.interpolate(spt_fts, size=mask.shape[-2:], mode='bilinear')
+        
+        # prototype
+        prototype = torch.sum(fts * mask[None, ...], dim=(-2, -1)) \
+                     / (mask[None, ...].sum(dim=(-2, -1)) + 1e-5)  # 1 x C
+        
+        # threshold learning
+        t = self.learnThreshold_a(fts)
+        t = torch.flatten(t, 1)
+        t = self.learnThreshold_b(t)
+
+        # prediction
+        sim = -F.cosine_similarity(qry_fts, prototype[..., None, None], dim=1) * self.scaler
+        pred = 1.0 - torch.sigmoid(0.5 * (sim - t))
 
         return pred
 
-    def getFeatures(self, fts, mask):
-        """
-        Extract foreground and background features via masked average pooling
+    def middle_information(self, spt_pred, qry_pred, spt_fts, qry_fts):
 
-        Args:
-            fts: input features, expect shape: 1 x C x H' x W'
-            mask: binary mask, expect shape: 1 x H x W
+        """
+        使用加权均值和加权中位数计算 原型 
         """
 
-        fts = F.interpolate(fts, size=mask.shape[-2:], mode='bilinear')
+        def weighted_prototype(fts, pred, method): 
+            if method == 'mean': 
+                proto = torch.sum(fts * pred[None, ...], dim=(-2, -1)) \
+                     / (pred[None, ...].sum(dim=(-2, -1)) + 1e-5)  # 1 x C
+            elif method == 'median': 
+                B, C, H, W = fts.shape
+                fts_flat = fts.view(B, C, -1)  # (B, C, H*W)
+                pred_flat = pred.view(B, 1, -1)  # (B, 1, H*W)
 
-        # masked fg features
-        masked_fts = torch.sum(fts * mask[None, ...], dim=(-2, -1)) \
-                     / (mask[None, ...].sum(dim=(-2, -1)) + 1e-5)  # 1 x C
 
-        return masked_fts
+                proto_list = []
+                for c in range(C):
+                    channel_fts = fts_flat[:, c, :]  # (B, H*W)
 
-    def getPrototype(self, fg_fts):
-        """
-        Average the features to obtain the prototype
+                    sorted_fts, indices = torch.sort(channel_fts, dim=-1)
+                    indices = indices.unsqueeze(1)  # (B, 1, H*W)
 
-        Args:
-            fg_fts: lists of list of foreground features for each way/shot
-                expect shape: Wa x Sh x [1 x C]
-            bg_fts: lists of list of background features for each way/shot
-                expect shape: Wa x Sh x [1 x C]
-        """
+                    sorted_weights = torch.gather(pred_flat, -1, indices)
+                
+                    cumsum_weights = torch.cumsum(sorted_weights, dim=-1)
+                    total_weight = cumsum_weights[:, :, -1:]
+                    median_weight = total_weight / 2
+                
+                    median_idx = torch.searchsorted(cumsum_weights, median_weight)
+                    median_value = torch.gather(sorted_fts, -1, median_idx.squeeze(1))
+                    proto_list.append(median_value)
 
-        n_ways, n_shots = len(fg_fts), len(fg_fts[0])
-        fg_prototypes = [torch.sum(torch.cat([tr for tr in way], dim=0), dim=0, keepdim=True) / n_shots for way in
-                         fg_fts]  ## concat all fg_fts
+                proto = torch.cat(proto_list, dim=1)  # (B, C)
 
-        return fg_prototypes
+            else: 
 
-    def compute_multiple_background_prototypes(self, bg_num, sup_fts, sup_fg, sampler):
-        """
-        Parameters
-        ----------
-        bg_num: int
-            Background partition numbers
-        sup_fts: torch.Tensor
-             [B, C, h, w], float32
-        sup_fg: torch. Tensor
-             [B, h, w], float32 (0,1)
-        sampler: np.random.RandomState
+                raise ValueError("Method must be either 'mean' or 'median'")
 
-        Returns
-        -------
-        bg_proto: torch.Tensor
-            [B, k, C], where k is the number of background proxies
-        """
+            return proto 
+ 
+        spt_fts = F.interpolate(spt_fts, size=spt_pred.shape[-2:], mode='bilinear')
+        qry_fts = F.interpolate(qry_fts, size=qry_pred.shape[-2:], mode='bilinear')
+        
+        spt_proto_mean = weighted_prototype(spt_fts, spt_pred, method = 'mean')
+        qry_proto_mean = weighted_prototype(qry_fts, qry_pred, method = 'mean')
+        
+        middle_proto_mean = self.middle_fusion(spt_proto_mean, qry_proto_mean)
+        
+        spt_proto_median = weighted_prototype(spt_fts, spt_pred, method = 'median')
+        qry_proto_median = weighted_prototype(qry_fts, qry_pred, method = 'median')
 
-        B, C, h, w = sup_fts.shape
-        bg_mask = F.interpolate(1 - sup_fg.unsqueeze(0), size=sup_fts.shape[-2:], mode='bilinear')
-        bg_mask = bg_mask.squeeze(0).bool()  # [B, h, w] --> bool
-        batch_bg_protos = []
+        middle_proto_median = self.middle_fusion(spt_proto_median, qry_proto_median)
 
-        for b in range(B):
-            bg_protos = []
+        proto = self.middle_fusion(middle_proto_mean, middle_proto_median)
 
-            bg_mask_i = bg_mask[b]  # [h, w]
+        return proto 
 
-            # Check if zero
-            with torch.no_grad():
-                if bg_mask_i.sum() < bg_num:
-                    bg_mask_i = bg_mask[b].clone()  # don't change original mask
-                    bg_mask_i.view(-1)[:bg_num] = True
-
-            # Iteratively select farthest points as centers of background local regions
-            all_centers = []
-            first = True
-            pts = torch.stack(torch.where(bg_mask_i), dim=1)
-            for _ in range(bg_num):
-                if first:
-                    i = sampler.choice(pts.shape[0])
-                    first = False
-                else:
-                    dist = pts.reshape(-1, 1, 2) - torch.stack(all_centers, dim=0).reshape(1, -1, 2)
-                    # choose the farthest point
-                    i = torch.argmax((dist ** 2).sum(-1).min(1)[0])
-                pt = pts[i]  # center y, x
-                all_centers.append(pt)
-
-            # Assign bg labels for bg pixels
-            dist = pts.reshape(-1, 1, 2) - torch.stack(all_centers, dim=0).reshape(1, -1, 2)
-            bg_labels = torch.argmin((dist ** 2).sum(-1), dim=1)
-
-            # Compute bg prototypes
-            bg_feats = sup_fts[b].permute(1, 2, 0)[bg_mask_i]  # [N, C]
-            for i in range(bg_num):
-                proto = bg_feats[bg_labels == i].mean(0)  # [C]
-                bg_protos.append(proto)
-
-            bg_protos = torch.stack(bg_protos, dim=1)  # [C, k]
-            batch_bg_protos.append(bg_protos)
-        bg_proto = torch.stack(batch_bg_protos, dim=0).transpose(1, 2)  # [B, k, C]
-
-        return bg_proto
-
-    def infoNCE(self, query_fg_proto, support_fg_proto, support_bg_protos, temperature=0.07):
-        """
-        计算自定义的InfoNCE loss
-
-        参数:
-        query_fg_proto: 形状为 [1, D] 的张量，表示query的前景原型
-        support_fg_proto: 形状为 [1, D] 的张量，表示support的前景原型
-        support_bg_protos: 形状为 [N, D] 的张量，表示N个support的背景原型
-        temperature: 温度参数，控制分布的平滑程度
-
-        返回:
-        loss: 标量，InfoNCE loss
-        """
-        # 确保输入维度正确
-        assert query_fg_proto.shape == (1, 512), "query_fg_proto should be [1, 512]"
-        assert support_fg_proto.shape == (1, 512), "support_fg_proto should be [1, 512]"
-        assert support_bg_protos.shape[1] == 512, "support_bg_protos should be [N, 512]"
-
-        # 归一化特征
-        query_fg_proto = F.normalize(query_fg_proto, dim=1)
-        support_fg_proto = F.normalize(support_fg_proto, dim=1)
-        support_bg_protos = F.normalize(support_bg_protos, dim=1)
-
-        # 计算正样本的相似度
-        pos_similarity = torch.sum(query_fg_proto * support_fg_proto) / temperature
-
-        # 计算负样本的相似度
-        neg_similarities = torch.matmul(query_fg_proto, support_bg_protos.T) / temperature
-
-        # 构建 logits
-        logits = torch.cat([pos_similarity.unsqueeze(0), neg_similarities.squeeze(0)])
-
-        # 创建标签：第一个（索引0）是正样本，其余都是负样本
-        labels = torch.zeros(1, dtype=torch.long, device=query_fg_proto.device)
-
-        # 计算交叉熵损失
-        loss = F.cross_entropy(logits.unsqueeze(0), labels)
-
-        return loss
-
-    def fgsm_attack(self, init_input, epsilon, data_grad_a, data_grad_b):
-
-        START_EPS = 16 / 255  # should be defined outside the function
-        init_input = init_input + torch.empty_like(init_input).uniform_(START_EPS, START_EPS)
-        sign_data_grad = data_grad_a.sign() + data_grad_b.sign()   # fusing perturbation
-
-        adv_input = init_input + epsilon * sign_data_grad
-
-        return adv_input
-
-    def AdaIN(self, content_features, style_features):
-        """
-        Apply Adaptive Instance Normalization (AdaIN) for 1D features.
-
-        Arguments:
-        content_features -- Tensor of content features, shape [N, C, L]
-        style_features -- Tensor of style features, shape [N, C, L]
-
-        Returns:
-        transformed_features -- the resulting features after AdaIN
-        """
-        content_features = content_features.unsqueeze(0)
-        style_features = style_features.unsqueeze(0)
-
-        # 计算内容特征的均值和方差
-        content_mean, content_std = self.calc_mean_std(content_features)
-
-        # 计算风格特征的均值和方差
-        style_mean, style_std = self.calc_mean_std(style_features)
-
-        # 将内容特征标准化并使用风格特征的均值和方差进行缩放
-        normalized_features = (content_features - content_mean.expand_as(content_features)) / content_std.expand_as(
-            content_features)
-        transformed_features = normalized_features * style_std.expand_as(content_features) + style_mean.expand_as(
-            content_features)
-
-        transformed_features = transformed_features.squeeze(0)
-
-        return transformed_features
-
-    def Whitening(self, feature_perturbed, feature_original):
-
-        loss_wt = torch.zeros(1).to(self.device)
-        # gram matrix
-        # gram_a = torch.mm(feature_perturbed.t(), feature_perturbed)
-        # gram_b = torch.mm(feature_original.t(), feature_original)
-        covar_a, B = self.get_covariance_matrix(feature_perturbed)
-        covar_b, B = self.get_covariance_matrix(feature_original)
-
-        absolute_difference_map = torch.abs(covar_a - covar_b + 1e-5)
-        absolute_difference_map_1D = absolute_difference_map.view(-1, 1)
-        labels, centroids = self.kmeans(absolute_difference_map_1D, n_clusters=5)
-        _, indices = centroids.view(-1).sort(descending=True)
-        reassigned_labels = torch.zeros_like(labels)
-        for i, idx in enumerate(indices):
-            reassigned_labels[labels == idx] = i + 1
-
-        cluster_map = reassigned_labels.view(512, 512)
-        mask = torch.where(cluster_map == 1, torch.tensor(1).cuda(), torch.tensor(0).cuda())
-
-        map_masked = absolute_difference_map * mask
-
-        map_masked = map_masked.unsqueeze(0)
-
-        off_diag_sum = torch.sum(torch.abs(map_masked), dim=(1, 2), keepdim=True) - self.margin
-        off_diag_sum = torch.torch.clamp(off_diag_sum, min=1e-5)
-
-        reversal_i = torch.ones(512, 512).triu(diagonal=1).cuda()
-        num_off_diagonal = torch.sum(reversal_i)
-        num_off_diagonal = torch.clamp(num_off_diagonal, min=1e-5)
-
-        loss_wt = torch.clamp(torch.div(off_diag_sum, num_off_diagonal), min=0)
-        loss_wt = torch.sum(loss_wt) / B
-        loss_wt = torch.where(torch.isnan(loss_wt), torch.zeros_like(loss_wt), loss_wt)
-
-        return loss_wt
-
-    def get_covariance_matrix(self, f_map, eye=None):
-        eps = 1e-5
-        B, C = f_map.shape  # feature size (B X C), here B is 1 and C is 512
-        if eye is None:
-            eye = torch.eye(C).cuda()
-
-        # Reshape f_map to a 3D tensor with a new dimension of size 1
-        # Now f_map has a shape of B X C X 1
-        f_map = f_map.view(B, C, -1)  # B X C X 1
-
-        # Since there is only one feature vector per batch, HW-1 becomes 1-1=0, which would cause a division by zero
-        # Thus, we skip the division and directly compute the covariance as the outer product of the vector with itself
-        f_cor = torch.bmm(f_map, f_map.transpose(1, 2)) + (eps * eye)
-
-        return f_cor, B
-
-    def kmeans(self, X, n_clusters, n_iters=100):
-        # 步骤1: 随机初始化中心点
-        centroids = X[torch.randperm(X.size(0))[:n_clusters]]
-
-        for _ in range(n_iters):
-            # 步骤2: 分配点到最近的中心点
-            distances = torch.cdist(X, centroids)
-            labels = torch.argmin(distances, dim=1)
-
-            # 步骤3: 更新中心点
-            new_centroids = []
-            for i in range(n_clusters):
-                cluster_points = X[labels == i]
-                if cluster_points.size(0) > 0:
-                    new_centroids.append(cluster_points.mean(0))
-                else:
-                    # 如果某个聚类为空，则保留原始中心
-                    new_centroids.append(centroids[i])
-
-            centroids = torch.stack(new_centroids)
-
-        return labels, centroids
-
+    def mask_feature(self, features, support_mask):
+        for idx, feature in enumerate(features):
+            mask = F.interpolate(support_mask.unsqueeze(1).float(), feature.size()[2:], mode='bilinear', align_corners=True)
+            features[idx] = features[idx] * mask
+        return features
     
+    def predict_mask(self, supp_imgs, supp_mask, qry_imgs, qry_mask, prompt, train=False):
 
+        # query_img = qry_imgs[0]
+        # support_img = supp_imgs[0][0]
+        # support_mask = supp_mask[0][0]
+
+        # Perform prediction for a single support set
+        logit_mask = self(supp_imgs, supp_mask, qry_imgs, qry_mask, prompt, train=False)
+        
+        if self.use_original_imgsize:
+            query_img = qry_imgs[0]
+            org_qry_imsize = query_img.shape[2:]  # Assuming query_img is a tensor with shape [B, C, H, W]
+            logit_mask = F.interpolate(logit_mask, size=org_qry_imsize, mode='bilinear', align_corners=True)
+            
+
+        visualize_segmentation_tensor(logit_mask)
+        # Get the predicted mask
+        pred_mask = logit_mask.argmax(dim=1)
+
+        
+        
+        # Average & quantize predictions given threshold (=0.5)
+        bsz = pred_mask.size(0)
+        max_vote = pred_mask.view(bsz, -1).max(dim=1)[0]
+        max_vote = torch.stack([max_vote, torch.ones_like(max_vote).long()])
+        max_vote = max_vote.max(dim=0)[0].view(bsz, 1, 1)
+        pred_mask = pred_mask.float() / max_vote
+        pred_mask[pred_mask < 0.5] = 0
+        pred_mask[pred_mask >= 0.5] = 1
+
+        return pred_mask 
+
+    def compute_objective(self, logit_mask, gt_mask):
+
+        bsz = logit_mask.size(0)
+
+        logit_mask = logit_mask.view(bsz, 2, -1)
+        gt_mask = gt_mask.view(bsz, -1).long()
+
+        return self.cross_entropy_loss(logit_mask, gt_mask)
+
+    def train_mode(self):
+        self.train()
+        self.backbone.eval()  # to prevent BN from learning data statistics with exponential averaging
+    
+    def CE_loss(self, pred, label):
+
+        """
+        :param pred: (1, 2, H, W)
+        :param label: (1, 2, H, W)
+        :return:
+        """
+
+        pred = pred.long()
+        label = label.long()
+        loss = self.criterion(torch.log(torch.clamp(pred, torch.finfo(torch.float32).eps,
+                                        1 - torch.finfo(torch.float32).eps)), label)
+        return loss
 
 
