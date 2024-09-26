@@ -208,6 +208,17 @@ class Weighting(nn.Module):
             nn.Linear(64, 1)
         )
 
+        # Residual Learning block
+        self.residual = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, kernel_size=1),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU(),
+            nn.Conv2d(in_channels, in_channels, kernel_size=1), 
+            nn.BatchNorm2d(in_channels)
+        )
+
+        self.relu = nn.ReLU()
+
     def forward(self, x, y, x_hidden, y_hidden):
         batch_size, C, H, W = x.size()
 
@@ -233,10 +244,6 @@ class Weighting(nn.Module):
         num_layers = min(len(x_hidden), self.max_hidden_layers)
         x_weights = F.softmax(self.hidden_weights1[:num_layers], dim=0)
         y_weights = F.softmax(self.hidden_weights2[:num_layers], dim=0)
-
-
-
-
         
         x_hidden_weighted = sum([w * h.mean(dim=[2, 3]) for w, h in zip(x_weights, x_hidden[:num_layers])])
         y_hidden_weighted = sum([w * h.mean(dim=[2, 3]) for w, h in zip(y_weights, y_hidden[:num_layers])])
@@ -246,9 +253,11 @@ class Weighting(nn.Module):
         gamma2 = self.gamma_gen2(y_hidden_weighted).view(batch_size, 1, 1, 1)
 
         # Apply gamma and add residual connection
-        out1 = gamma1 * out1 + x
-        out2 = gamma2 * out2 + y
-
+        out1 = self.residual(gamma1 * out1) + x
+        out1 = self.relu(out1)
+        out2 = self.residual(gamma2 * out2) + y
+        out2 = self.relu(out2)
+        
         return out1, out2
 
 class Weighting_old(nn.Module):
