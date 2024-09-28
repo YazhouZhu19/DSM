@@ -11,7 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 from .encoder import Res50Encoder
-from .clip_encoders import *
+# from .clip_encoders import *
 from .decoders import *
 
 
@@ -25,6 +25,8 @@ from .base.correlation import Correlation
 from .learner import MixedLearner
 # from .learner import Matching
 import matplotlib.pyplot as plt
+
+from mamba_ssm import Mamba 
 
 
 def visualize_segmentation_tensor(tensor):
@@ -208,16 +210,17 @@ class Weighting(nn.Module):
             nn.Linear(64, 1)
         )
 
-        # Residual Learning block
+        # residual learning block
         self.residual = nn.Sequential(
             nn.Conv2d(in_channels, in_channels, kernel_size=1),
             nn.BatchNorm2d(in_channels),
             nn.ReLU(),
-            nn.Conv2d(in_channels, in_channels, kernel_size=1), 
+            nn.Conv2d(in_channels, in_channels, kernel_size=1),
             nn.BatchNorm2d(in_channels)
         )
 
         self.relu = nn.ReLU()
+
 
     def forward(self, x, y, x_hidden, y_hidden):
         batch_size, C, H, W = x.size()
@@ -244,6 +247,7 @@ class Weighting(nn.Module):
         num_layers = min(len(x_hidden), self.max_hidden_layers)
         x_weights = F.softmax(self.hidden_weights1[:num_layers], dim=0)
         y_weights = F.softmax(self.hidden_weights2[:num_layers], dim=0)
+
         
         x_hidden_weighted = sum([w * h.mean(dim=[2, 3]) for w, h in zip(x_weights, x_hidden[:num_layers])])
         y_hidden_weighted = sum([w * h.mean(dim=[2, 3]) for w, h in zip(y_weights, y_hidden[:num_layers])])
@@ -255,9 +259,10 @@ class Weighting(nn.Module):
         # Apply gamma and add residual connection
         out1 = self.residual(gamma1 * out1) + x
         out1 = self.relu(out1)
-        out2 = self.residual(gamma2 * out2) + y
+
+        out2 = self.residual(gamma2 * out2) + y 
         out2 = self.relu(out2)
-        
+
         return out1, out2
 
 class Weighting_old(nn.Module):
@@ -299,6 +304,64 @@ class Weighting_old(nn.Module):
         out2 = self.gamma2 * out2 + y
 
         return out1, out2
+
+class factor_learning(nn.Module):
+
+    def __init__(self, dim):
+        super(factor_learning, self).__init__()
+
+        self.in_channel = dim
+        self.batch = 1
+
+        self.mamba = Mamba(
+            d_model=dim,
+            d_state=16,
+            d_conv=4,
+            expand=2,
+        ).to("cuda")
+        self.LN = nn.LayerNorm(self.in_channel)
+
+        self.linear = nn.Conv1d(
+            in_channels=self.in_channel,
+            out_channels=self.in_channel,
+            kernel_size=3, 
+            padding='same'
+        )
+        
+        self.relu = nn.ReLU()
+        
+        self.mlp_a = nn.Linear(dim, 1)
+        self.mlp_b = nn.Linear(128, 1)
+
+
+    def forward(self, spt_fts, qry_fts):
+
+        """
+        spt_fts: (1, 512, 8, 8)
+        qry_fts: (1, 512, 8, 8)
+        """
+
+        B, dim, h, w = spt_fts.size()
+        spt_fts = spt_fts.view(B, h*w, dim)         # (1, 64, 512)
+        qry_fts = qry_fts.view(B, h*w, dim)         # (1, 64, 512)
+        
+        fts = torch.cat([spt_fts, qry_fts], dim=1)  # (1, 128, 512)
+        fts = fts.permute(0, 2, 1)  # (1, 512, 128)
+        fts = self.linear(fts)      # (1, 512, 128)
+        fts = self.LN(fts.transpose(1, 2)).transpose(2, 1)      # (1, 512, 128)
+        fts = self.relu(fts)        # (1, 512, 128)
+
+        fts_ = self.mamba(fts.transpose(1, 2)).transpose(2, 1)  # (1, 512, 128)   
+        fts = fts_ + fts            # (1, 512, 128)
+        fts = self.LN(fts.transpose(1, 2)).transpose(2, 1)      # (1, 512, 128)          
+        
+        coff = self.mlp_a(fts.transpose(1, 2)).transpose(2, 1)  # (1, 1, 128)
+        coff = self.mlp_b(coff).squeeze(-1).squeeze(-1)         
+        coff = torch.sigmoid(coff)
+
+        return coff
+
+
 
 
 class FeatureExtractor(nn.Module):
@@ -372,6 +435,8 @@ class FewShotSeg(nn.Module):
 
         # self.matching = Matching(list(reversed(nbottlenecks[-3:])))
 
+        self.factor_learning = factor_learning(dim=512) 
+
 
 
     def forward(self, supp_imgs, supp_mask, qry_imgs, qry_mask, prompt, train=False):
@@ -414,16 +479,19 @@ class FewShotSeg(nn.Module):
         ################################### Support-query features re-weighting ##################################
         spt_fts, qry_fts = support_feats[num_inner_layer - 1], query_feats[num_inner_layer - 1]
         spt_hidden_fts, qry_hidden_fts = support_feats[:-1], query_feats[:-1]
-        spt_weighted_fts, qry_weighted_fts = self.weighting(spt_fts, qry_fts, spt_hidden_fts, qry_hidden_fts)
+        spt_weighted_fts, qry_weighted_fts = self.weighting(spt_fts, qry_fts, spt_hidden_fts, qry_hidden_fts)   
 
+        ################################ Dynamic Selected Semantic Information Learning ###############################
+        A = self.factor_learning(spt_weighted_fts, qry_weighted_fts)
         
+
+
 
 
         
         for idx in range(num_inner_layer): 
 
             qry_fts_inner, spt_fts_inner = query_feats[idx], support_feats[idx]
-
 
             ############################### Intermediate Information Extraction ################################
             weighted_inner_ft_qry, weighted_inner_ft_spt  = self.weighting_old(qry_fts_inner, spt_fts_inner)
