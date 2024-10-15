@@ -3,6 +3,8 @@ encoder resnet50, GNN geometrical feature extractor, feature transform operation
 """
 from re import A
 from tkinter import W
+from turtle import forward
+from xml.etree.ElementInclude import include
 import numpy as np
 import cv2
 import math
@@ -247,7 +249,6 @@ class Weighting(nn.Module):
         num_layers = min(len(x_hidden), self.max_hidden_layers)
         x_weights = F.softmax(self.hidden_weights1[:num_layers], dim=0)
         y_weights = F.softmax(self.hidden_weights2[:num_layers], dim=0)
-
         
         x_hidden_weighted = sum([w * h.mean(dim=[2, 3]) for w, h in zip(x_weights, x_hidden[:num_layers])])
         y_hidden_weighted = sum([w * h.mean(dim=[2, 3]) for w, h in zip(y_weights, y_hidden[:num_layers])])
@@ -342,10 +343,10 @@ class factor_learning(nn.Module):
         """
 
         B, dim, h, w = spt_fts.size()
-        spt_fts = spt_fts.view(B, h*w, dim)         # (1, 64, 512)
-        qry_fts = qry_fts.view(B, h*w, dim)         # (1, 64, 512)
+        spt_fts = spt_fts.view(B, h*w, dim)             # (1, 64, 512)
+        qry_fts = qry_fts.view(B, h*w, dim)             # (1, 64, 512)
         
-        fts = torch.cat([spt_fts, qry_fts], dim=1)  # (1, 128, 512)
+        fts = torch.cat([spt_fts, qry_fts], dim=1)      # (1, 128, 512)
         fts = fts.permute(0, 2, 1)  # (1, 512, 128)
         fts = self.linear(fts)      # (1, 512, 128)
         fts = self.LN(fts.transpose(1, 2)).transpose(2, 1)      # (1, 512, 128)
@@ -356,13 +357,10 @@ class factor_learning(nn.Module):
         fts = self.LN(fts.transpose(1, 2)).transpose(2, 1)      # (1, 512, 128)          
         
         coff = self.mlp_a(fts.transpose(1, 2)).transpose(2, 1)  # (1, 1, 128)
-        coff = self.mlp_b(coff).squeeze(-1).squeeze(-1)         
+        coff = self.mlp_b(coff).squeeze(-1).squeeze(-1)         # (1)
         coff = torch.sigmoid(coff)
 
         return coff
-
-
-
 
 class FeatureExtractor(nn.Module):
     def __init__(self):
@@ -372,7 +370,6 @@ class FeatureExtractor(nn.Module):
     
     def forward(self, x):
         return self.features(x)
-
 
 class FewShotSeg(nn.Module):
 
@@ -437,6 +434,15 @@ class FewShotSeg(nn.Module):
 
         self.factor_learning = factor_learning(dim=512) 
 
+        self.channel_importance = nn.Sequential(
+            nn.Linear(1024, 256), 
+            nn.ReLU(),
+            nn.Linear(256, 1024),
+            nn.Sigmoid()
+        )
+
+        self.adaptive_pool = nn.AdaptiveAvgPool1d(512)
+
 
 
     def forward(self, supp_imgs, supp_mask, qry_imgs, qry_mask, prompt, train=False):
@@ -479,61 +485,25 @@ class FewShotSeg(nn.Module):
         ################################### Support-query features re-weighting ##################################
         spt_fts, qry_fts = support_feats[num_inner_layer - 1], query_feats[num_inner_layer - 1]
         spt_hidden_fts, qry_hidden_fts = support_feats[:-1], query_feats[:-1]
-        spt_weighted_fts, qry_weighted_fts = self.weighting(spt_fts, qry_fts, spt_hidden_fts, qry_hidden_fts)   
+        spt_weighted_fts, qry_weighted_fts = self.weighting(spt_fts, qry_fts, spt_hidden_fts, qry_hidden_fts)     # (1, C, h, w) (1, C, h, w)
 
         ################################ Dynamic Selected Semantic Information Learning ###############################
-        A = self.factor_learning(spt_weighted_fts, qry_weighted_fts)
-        
+        coff = self.factor_learning(spt_weighted_fts, qry_weighted_fts)
+        coarse_pred = self.coarse_prediction(spt_weighted_fts, qry_weighted_fts, support_mask.clone())
+        coarse_pred = coarse_pred.unsqueeze(0)  # (1, 1, h, w)
+        coarse_pred = F.interpolate(coarse_pred, size=img_size, mode='bilinear', align_corners=True)
+        if train: 
+            preds_coarse = torch.cat((1.0 - coarse_pred, coarse_pred), dim=1)
 
+        semantic_information = self.dynamic_selection(support_mask.clone(), coarse_pred.clone(), spt_weighted_fts, qry_weighted_fts, coff)
 
-
-
-        
-        for idx in range(num_inner_layer): 
-
-            qry_fts_inner, spt_fts_inner = query_feats[idx], support_feats[idx]
-
-            ############################### Intermediate Information Extraction ################################
-            weighted_inner_ft_qry, weighted_inner_ft_spt  = self.weighting_old(qry_fts_inner, spt_fts_inner)
-            # add semantic information and coarse prediction calculation
-            coarse_pred = self.coarse_prediction(weighted_inner_ft_spt, weighted_inner_ft_qry, support_mask.clone())
-            # middle prototype calculation
-            middle_prototype = self.middle_information(support_mask.clone(), coarse_pred.clone(), weighted_inner_ft_spt, weighted_inner_ft_qry)
-            
-            # if train:
-            #     # loss for support image 
-            #     t_spt = self.learnThreshold_a(support_feats[num_inner_layer - 1])
-            #     t_spt = torch.flatten(t_spt, 1)
-            #     t_spt = self.learnThreshold_b(t_spt)
-            #     sim_spt = -F.cosine_similarity(support_feats[num_inner_layer - 1], middle_prototype[..., None, None], dim=1) * self.scaler
-            #     pred_spt = 1.0 - torch.sigmoid(0.5 * (sim_spt - t_spt))
-            #     pred_spt = pred_spt.unsqueeze(0)
-            #     pred_spt = F.interpolate(pred_spt, size=img_size, mode='bilinear', align_corners=True)
-            #     pred_spt = torch.cat((1.0 - pred_spt, pred_spt), dim=1)
-
-            #     loss_spt_middle = self.CE_loss(pred_spt, support_mask.clone())
-
-            #     # loss for query image
-            #     t_qry = self.learnThreshold_a(query_feats[num_inner_layer - 1])
-            #     t_qry = torch.flatten(t_qry, 1)
-            #     t_qry = self.learnThreshold_b(t_qry)
-            #     sim_qry = -F.cosine_similarity(query_feats[num_inner_layer - 1], middle_prototype[..., None, None], dim=1) * self.scaler
-            #     pred_qry = 1.0 - torch.sigmoid(0.5 * (sim_qry - t_qry))
-            #     pred_qry = pred_qry.unsqueeze(0)
-            #     pred_qry = F.interpolate(pred_qry, size=img_size, mode='bilinear', align_corners=True)
-            #     pred_qry = torch.cat((1.0 - pred_qry, pred_qry), dim=1)
-
-            #     loss_qry_middle = self.CE_loss(pred_qry, query_mask.clone())
-
-            middle_prototypes.append(middle_prototype)
-            ##############################################################################################
-        
-        
-        
-        ##################################### Similarity Calculation ####################################### 
-        support_feats = self.mask_feature(support_feats, support_mask.clone())
-        corr = Correlation.multilayer_correlation_new(query_feats, support_feats, self.stack_ids, middle_prototypes)
-        #####################################################################################################
+        ################################ Semantic Information Guided Correlation Estimation ###########################  
+        spt_hidden_fts.append(spt_weighted_fts)
+        qry_hidden_fts.append(qry_weighted_fts)
+       
+        spt_fts = self.mask_feature(spt_hidden_fts, support_mask.clone())
+        corr = Correlation.multilayer_correlation_new(qry_hidden_fts, spt_hidden_fts, self.stack_ids, semantic_information)
+        # #####################################################################################################
 
  
         ########################################## Decoder #########################################
@@ -543,7 +513,7 @@ class FewShotSeg(nn.Module):
         if not self.use_original_imgsize:
             logit_mask = F.interpolate(logit_mask, size=img_size, mode='bilinear', align_corners=True)
 
-        return logit_mask, loss_spt_middle, loss_qry_middle
+        return logit_mask, loss_spt_middle, loss_qry_middle, preds_coarse
     
     
     # designed functions
@@ -596,7 +566,6 @@ class FewShotSeg(nn.Module):
                 B, C, H, W = fts.shape
                 fts_flat = fts.view(B, C, -1)  # (B, C, H*W)
                 pred_flat = pred.view(B, 1, -1)  # (B, 1, H*W)
-
 
                 proto_list = []
                 for c in range(C):
@@ -704,5 +673,90 @@ class FewShotSeg(nn.Module):
         loss = self.criterion(torch.log(torch.clamp(pred, torch.finfo(torch.float32).eps,
                                         1 - torch.finfo(torch.float32).eps)), label)
         return loss
+
+    def weighted_protos(self, fts, pred, type): 
+        if type == 'mean':
+            proto = torch.sum(fts * pred[None, ...], dim=(-2, -1)) \
+                     / (pred[None, ...].sum(dim=(-2, -1)) + 1e-5)  # 1 x C
+        elif type == 'median': 
+
+            B, C, H, W = fts.shape
+            fts_flat = fts.view(B, C, -1)  # (B, C, H*W)
+            pred_flat = pred.view(B, 1, -1)  # (B, 1, H*W)
+
+            proto_list = []
+            for c in range(C):
+                channel_fts = fts_flat[:, c, :]  # (B, H*W)
+
+                sorted_fts, indices = torch.sort(channel_fts, dim=-1)
+                indices = indices.unsqueeze(1)  # (B, 1, H*W)
+                sorted_weights = torch.gather(pred_flat, -1, indices)
+                cumsum_weights = torch.cumsum(sorted_weights, dim=-1)
+                total_weight = cumsum_weights[:, :, -1:]
+                median_weight = total_weight / 2
+
+                median_idx = torch.searchsorted(cumsum_weights, median_weight)
+                median_value = torch.gather(sorted_fts, -1, median_idx.squeeze(1))
+                proto_list.append(median_value)
+            proto = torch.cat(proto_list, dim=1)  # (B, C)
+
+        else: 
+
+            raise ValueError("Method must be either 'mean' or 'median'")
+        
+        return proto
+    
+    def dynamic_selection(self, spt_mask, qry_mask, spt_fts, qry_fts, coff):
+
+        """
+        spt_mask: (1, H, W)
+        qry_mask: (1, 1, H, W)
+        spt_fts: (1, C, h, w)
+        qry_fts: (1, C, h, w)
+        coff: (1)
+        """
+
+        B, C, h, w = spt_fts.size()
+        qry_mask = qry_mask.squeeze(0)  # (1, H, W)
+        B, H, W = qry_mask.size()
+
+        spt_fts = F.interpolate(spt_fts, size=spt_mask.shape[-2:], mode='bilinear')
+        qry_fts = F.interpolate(qry_fts, size=qry_mask.shape[-2:], mode='bilinear')
+
+        spt_proto_mean = self.weighted_protos(spt_fts, spt_mask, type='mean')
+        spt_proto_median = self.weighted_protos(spt_fts, spt_mask, type = 'median')
+
+        qry_proto_mean = self.weighted_protos(qry_fts, qry_mask, type = 'mean')
+        qry_proto_median = self.weighted_protos(qry_fts, qry_mask, type = 'median')
+
+        proto_mean = self.middle_fusion(spt_proto_mean, qry_proto_mean)         # (1, 512)
+        proto_median = self.middle_fusion(spt_proto_median, qry_proto_median)   # (1, 512)
+
+        # 通道交织
+        proto_mean_chunks = proto_mean.chunk(2, dim=1)  
+        proto_median_chunks = proto_median.chunk(2, dim=1)
+        proto = torch.cat([
+            torch.cat([proto_mean_chunks[0], proto_median_chunks[0]], dim=1),
+            torch.cat([proto_mean_chunks[1], proto_median_chunks[1]], dim=1)
+        ], dim=1)   # (1, 1024)
+
+        _, feat_dim = proto.shape
+        
+        channel_weights = self.channel_importance(proto)
+        
+        num_channels_to_keep = int(feat_dim * coff)
+        _, indices = torch.topk(channel_weights, num_channels_to_keep, dim=1)
+        indices = indices.sort(dim=1)[0]
+        proto = torch.gather(proto, 1, indices)  # (1, N*)
+        
+        # adaptive pooling for channels
+        proto = proto.unsqueeze(1)
+        proto = self.adaptive_pool(proto)   
+        proto = proto.squeeze(1)
+
+        return proto
+
+
+
 
 
