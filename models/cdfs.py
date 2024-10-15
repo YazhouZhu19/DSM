@@ -1,6 +1,3 @@
-"""
-encoder resnet50, GNN geometrical feature extractor, feature transform operation
-"""
 from re import A
 from tkinter import W
 from turtle import forward
