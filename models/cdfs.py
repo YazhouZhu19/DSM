@@ -10,7 +10,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 from .encoder import Res50Encoder
-# from .clip_encoders import *
 from .decoders import *
 
 
@@ -22,7 +21,6 @@ import torchvision.models as models
 from .base.feature import extract_feat_vgg, extract_feat_res
 from .base.correlation import Correlation
 from .learner import MixedLearner
-# from .learner import Matching
 import matplotlib.pyplot as plt
 
 from mamba_ssm import Mamba 
