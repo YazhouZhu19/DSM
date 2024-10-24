@@ -676,24 +676,34 @@ class FewShotSeg(nn.Module):
         elif type == 'median': 
 
             B, C, H, W = fts.shape
-            fts_flat = fts.view(B, C, -1)  # (B, C, H*W)
+            fts_flat = fts.view(B, C, -1)    # (B, C, H*W)
             pred_flat = pred.view(B, 1, -1)  # (B, 1, H*W)
+            
 
             proto_list = []
             for c in range(C):
-                channel_fts = fts_flat[:, c, :]  # (B, H*W)
+                channel_fts = fts_flat[:, c, :]               # (B, H*W)
+                pred_flat = pred_flat.squeeze(1)
+                channel_fts_masked = channel_fts * pred_flat  # (B, H*W)
+                
+                foreground_elements = channel_fts_masked[channel_fts_masked != 0.]
 
-                sorted_fts, indices = torch.sort(channel_fts, dim=-1)
-                indices = indices.unsqueeze(1)  # (B, 1, H*W)
-                sorted_weights = torch.gather(pred_flat, -1, indices)
-                cumsum_weights = torch.cumsum(sorted_weights, dim=-1)
-                total_weight = cumsum_weights[:, :, -1:]
-                median_weight = total_weight / 2
+                if len(foreground_elements) == 0:
+                    raise ValueError("There are no nozero elements.")
+                
+                sorted_elements = torch.sort(foreground_elements)[0]
+                n = len(sorted_elements)
 
-                median_idx = torch.searchsorted(cumsum_weights, median_weight)
-                median_value = torch.gather(sorted_fts, -1, median_idx.squeeze(1))
-                proto_list.append(median_value)
-            proto = torch.cat(proto_list, dim=1)  # (B, C)
+                if n % 2 == 1:
+                    median_element = sorted_elements[n//2]
+                else:
+                    median_element = (sorted_elements[n//2 - 1] + sorted_elements[n//2]) / 2
+                
+                median_element = median_element.unsqueeze(0).unsqueeze(0)
+                
+                proto_list.append(median_element)
+            proto = torch.cat(proto_list, dim=1)  # (1, C)
+            
 
         else: 
 
