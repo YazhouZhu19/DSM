@@ -723,7 +723,7 @@ class FewShotSeg(nn.Module):
         proto_mean = self.middle_fusion(spt_proto_mean, qry_proto_mean)         # (1, 512)
         proto_median = self.middle_fusion(spt_proto_median, qry_proto_median)   # (1, 512)
 
-        # 通道交织
+        # chunk for channels
         proto_mean_chunks = proto_mean.chunk(2, dim=1)  
         proto_median_chunks = proto_median.chunk(2, dim=1)
         proto = torch.cat([
