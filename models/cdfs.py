@@ -675,9 +675,14 @@ class FewShotSeg(nn.Module):
                      / (pred[None, ...].sum(dim=(-2, -1)) + 1e-5)  # 1 x C
         elif type == 'median': 
 
+            
+            
             B, C, H, W = fts.shape
             fts_flat = fts.view(B, C, -1)    # (B, C, H*W)
             pred_flat = pred.view(B, 1, -1)  # (B, 1, H*W)
+
+            length = H * W
+            
             
 
             proto_list = []
