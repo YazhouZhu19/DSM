@@ -680,20 +680,34 @@ class FewShotSeg(nn.Module):
             pred_flat = pred.view(B, 1, -1)  # (B, 1, H*W)
         
             fts_masked = fts_flat * pred_flat  # (1, C, H*W)
+
+            # remove zero elements 
+            sum_along_c = fts_masked.sum(dim=1) # (1, H*W)
+            nonzero_mask = sum_along_c != 0     # (1, H*W)
+            expanded_mask = nonzero_mask.unsqueeze(1)
+            expanded_mask = expanded_mask.expand(-1, fts_masked.shape[1], -1)
+
+            fts_masked_nonzero = fts_masked[expanded_mask].reshape(1, fts_masked.shape[1], -1)  # (1, C, Nonzero_num)
             
-            fts_masked_sum = torch.sum(fts_masked, dim=1)   # (1, H*W)
-            
-            # get median id
-            values = fts_masked_sum[0]
-            _, indices = torch.sort(values)
-            n = len(values)
-            if n % 2 == 0: 
-                median_pos = n // 2 - 1 
+            _, _, dimension = fts_masked_nonzero.shape
+
+            if dimension != 0:
+                fts_masked_nonzero_sum = torch.sum(fts_masked_nonzero, dim=1)  # (1, Nonzero_num)
+                
+                # get median id
+                values = fts_masked_nonzero_sum[0]
+                _, indices = torch.sort(values)
+                n = len(values)
+                if n % 2 == 0:
+                    median_pos = n // 2 - 1 
+                else: 
+                    median_pos = n // 2 
+                    
+                median_index = indices[median_pos].item()
+                proto = fts_masked_nonzero[:, :, median_index]
             else:
-                median_pos = n // 2
-            median_index = indices[median_pos].item()
-            
-            proto = fts_masked[:, :, median_index]
+                proto = torch.sum(fts * pred[None, ...], dim=(-2, -1)) \
+                     / (pred[None, ...].sum(dim=(-2, -1)) + 1e-5)
             
         return proto
     
