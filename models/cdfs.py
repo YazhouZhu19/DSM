@@ -675,45 +675,26 @@ class FewShotSeg(nn.Module):
                      / (pred[None, ...].sum(dim=(-2, -1)) + 1e-5)  # 1 x C
         elif type == 'median': 
 
-            
-            
             B, C, H, W = fts.shape
             fts_flat = fts.view(B, C, -1)    # (B, C, H*W)
             pred_flat = pred.view(B, 1, -1)  # (B, 1, H*W)
-
-            length = H * W
-            
-            
-
-            proto_list = []
-            for c in range(C):
-                channel_fts = fts_flat[:, c, :]               # (B, H*W)
-                pred_flat = pred_flat.squeeze(1)
-                channel_fts_masked = channel_fts * pred_flat  # (B, H*W)
-                
-                foreground_elements = channel_fts_masked[channel_fts_masked != 0.]
-
-                if len(foreground_elements) == 0:
-                    raise ValueError("There are no nozero elements.")
-                
-                sorted_elements = torch.sort(foreground_elements)[0]
-                n = len(sorted_elements)
-
-                if n % 2 == 1:
-                    median_element = sorted_elements[n//2]
-                else:
-                    median_element = (sorted_elements[n//2 - 1] + sorted_elements[n//2]) / 2
-                
-                median_element = median_element.unsqueeze(0).unsqueeze(0)
-                
-                proto_list.append(median_element)
-            proto = torch.cat(proto_list, dim=1)  # (1, C)
-            
-
-        else: 
-
-            raise ValueError("Method must be either 'mean' or 'median'")
         
+            fts_masked = fts_flat * pred_flat  # (1, C, H*W)
+            
+            fts_masked_sum = torch.sum(fts_masked, dim=1)   # (1, H*W)
+            
+            # get median id
+            values = fts_masked_sum[0]
+            _, indices = torch.sort(values)
+            n = len(values)
+            if n % 2 == 0: 
+                median_pos = n // 2 - 1 
+            else:
+                median_pos = n // 2
+            median_index = indices[median_pos].item()
+            
+            proto = fts_masked[:, :, median_index]
+            
         return proto
     
     def dynamic_selection(self, spt_mask, qry_mask, spt_fts, qry_fts, coff):
