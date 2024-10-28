@@ -1,3 +1,8 @@
+#!/usr/bin/env python
+"""
+For Evaluation
+Extended from ADNet code by Hansen et al.
+"""
 import os
 import random
 import logging
@@ -8,7 +13,7 @@ import torch.backends.cudnn as cudnn
 import torch.optim
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import MultiStepLR
-from models.cdfs import FewShotSeg
+from models.cdfs_dsm import FewShotSeg
 from dataloaders.datasets import TrainDataset as TrainDataset
 from dataloaders.dataset_specifics import *
 from utils import *
@@ -135,22 +140,30 @@ def main(_run, _config, _log):
             # prompt
             class_idx = sample['selected_class']
             labels = get_label_names(_config['dataset'])
+            # prompt = labels[int(class_idx.item())]
+            
+            # prompt = _config['dataset']
 
             query_images = [query_image.float().cuda() for query_image in sample['query_images']]
             query_labels = torch.cat([query_label.long().cuda() for query_label in sample['query_labels']], dim=0)
 
             # Compute outputs and losses.
-            query_pred, loss_inter_spt, loss_inter_qry = model(support_images, support_fg_mask, query_images, query_labels, _, train=True)
+            query_pred, loss_spt_middle, loss_qry_middle, pred_coarse, loss_align = model(support_images, support_fg_mask, query_images, query_labels, train=True)
 
             loss = model.module.compute_objective(query_pred.float(), query_labels)
+            loss_coarse = model.module.compute_objective(pred_coarse.float(), query_labels)
 
-            loss = loss + loss_inter_spt + loss_inter_qry
+            loss_whole = loss + loss_spt_middle + loss_qry_middle + loss_coarse + loss_align
+
+            # query_pred = torch.argmax(query_pred, dim=1)
+            # pixel_acc = pixel_accuracy(query_pred.detach().data.cpu().numpy(), query_labels.detach().data.cpu().numpy())
+            # print(pixel_acc)      
         
             # Compute gradient and do SGD step.
             for param in model.parameters():
                 param.grad = None
 
-            loss.backward()
+            loss_whole.backward()
             optimizer.step()
             scheduler.step()
 
