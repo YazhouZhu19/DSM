@@ -1,9 +1,14 @@
+#!/usr/bin/env python
+"""
+For evaluation
+Extended from ADNet code by Hansen et al.
+"""
 import shutil
 import SimpleITK as sitk
 import torch.backends.cudnn as cudnn
 import torch.optim
 from torch.utils.data import DataLoader
-from models.cdfs import FewShotSeg
+from models.cdfs_dsm import FewShotSeg
 from dataloaders.datasets import TestDataset
 from dataloaders.dataset_specifics import *
 from utils import *
@@ -148,11 +153,12 @@ def main(_run, _config, _log):
                     for i in range(query_image_s.shape[0]):
                         # _pred_s= model([support_image_s], [support_fg_mask_s], [query_image_s[[i]]], _, prompt, train=False)  # 1 x 2 x H x W
 
-                        _pred_s, _, _ = model.module.predict_mask([support_image_s], [support_fg_mask_s], [query_image_s[[i]]], _, prompt, train=False)                    
+                        # _pred_s= model.module.predict_mask([support_image_s], [support_fg_mask_s], [query_image_s[[i]]], _, prompt, train=False)                    
+                        _pred_s, _, _, _ = model([support_image_s], [support_fg_mask_s], [query_image_s[[i]]], _, train=False)  # 1 x 2 x H x W
                         query_pred_s.append(_pred_s)
 
                     query_pred_s = torch.cat(query_pred_s, dim=0)
-                    # query_pred_s = query_pred_s.argmax(dim=1).cpu()  # C x H x W
+                    query_pred_s = query_pred_s.argmax(dim=1).cpu()  # C x H x W
                     query_pred[idx_[sub_chunck]:idx_[sub_chunck + 1]] = query_pred_s
      
                 
