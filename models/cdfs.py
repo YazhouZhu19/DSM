@@ -1,3 +1,6 @@
+"""
+encoder resnet50, GNN geometrical feature extractor, feature transform operation
+"""
 from re import A
 from tkinter import W
 from turtle import forward
@@ -10,6 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 from .encoder import Res50Encoder
+# from .clip_encoders import *
 from .decoders import *
 
 
@@ -21,6 +25,7 @@ import torchvision.models as models
 from .base.feature import extract_feat_vgg, extract_feat_res
 from .base.correlation import Correlation
 from .learner import MixedLearner
+# from .learner import Matching
 import matplotlib.pyplot as plt
 
 from mamba_ssm import Mamba 
@@ -329,7 +334,6 @@ class factor_learning(nn.Module):
         self.mlp_a = nn.Linear(dim, 1)
         self.mlp_b = nn.Linear(128, 1)
 
-
     def forward(self, spt_fts, qry_fts):
 
         """
@@ -438,9 +442,11 @@ class FewShotSeg(nn.Module):
 
         self.adaptive_pool = nn.AdaptiveAvgPool1d(512)
 
+        self.device = torch.device('cuda')
 
 
-    def forward(self, supp_imgs, supp_mask, qry_imgs, qry_mask, prompt, train=False):
+
+    def forward(self, supp_imgs, supp_mask, qry_imgs, qry_mask, train=False):
 
         """
         Args:
@@ -456,22 +462,26 @@ class FewShotSeg(nn.Module):
 
         query_img = qry_imgs[0]
         support_img = supp_imgs[0][0]
-        support_mask = supp_mask[0][0]
+        support_mask = supp_mask[0][0]  # (1, 256, 256)
         query_mask = qry_mask
+
 
         img_size = supp_imgs[0][0].shape[-2:]
         loss_spt_middle = torch.zeros(1).to(self.device)
         loss_qry_middle = torch.zeros(1).to(self.device)
 
-        with torch.no_grad():
+        # with torch.no_grad():
 
-            query_feats = self.extract_feats(query_img, self.backbone, self.feat_ids, self.bottleneck_ids, self.lids)
-            # query_feats: (n-1) x (1, 512, 32 or 16, 32 or 16)   query_final_feats: (1, 512, 8, 8)
-            support_feats = self.extract_feats(support_img, self.backbone, self.feat_ids, self.bottleneck_ids, self.lids)
-            # support_feats: (n-1) x (1, 512, 32 or 16, 32 or 16)  support_final_feats: (1, 512, 8, 8)
+        #     query_feats = self.extract_feats(query_img, self.backbone, self.feat_ids, self.bottleneck_ids, self.lids)
+        #     # query_feats: (n-1) x (1, 512, 32 or 16, 32 or 16)   query_final_feats: (1, 512, 8, 8)
+        #     support_feats = self.extract_feats(support_img, self.backbone, self.feat_ids, self.bottleneck_ids, self.lids)
+        #     # support_feats: (n-1) x (1, 512, 32 or 16, 32 or 16)  support_final_feats: (1, 512, 8, 8)
 
-            # support_feats = self.mask_feature(support_feats, support_mask.clone())
-            # corr = Correlation.multilayer_correlation(query_feats, support_feats, self.stack_ids)
+        #     # support_feats = self.mask_feature(support_feats, support_mask.clone())
+        #     # corr = Correlation.multilayer_correlation(query_feats, support_feats, self.stack_ids)
+
+        query_feats = self.extract_feats(query_img, self.backbone, self.feat_ids, self.bottleneck_ids, self.lids)
+        support_feats = self.extract_feats(support_img, self.backbone, self.feat_ids, self.bottleneck_ids, self.lids)
         
         num_inner_layer = len(self.feat_ids)
         # inner features  
@@ -483,21 +493,38 @@ class FewShotSeg(nn.Module):
         spt_weighted_fts, qry_weighted_fts = self.weighting(spt_fts, qry_fts, spt_hidden_fts, qry_hidden_fts)     # (1, C, h, w) (1, C, h, w)
 
         ################################ Dynamic Selected Semantic Information Learning ###############################
+        # step 1: Selection Factor Learning
         coff = self.factor_learning(spt_weighted_fts, qry_weighted_fts)
         coarse_pred = self.coarse_prediction(spt_weighted_fts, qry_weighted_fts, support_mask.clone())
         coarse_pred = coarse_pred.unsqueeze(0)  # (1, 1, h, w)
         coarse_pred = F.interpolate(coarse_pred, size=img_size, mode='bilinear', align_corners=True)
-        if train: 
-            preds_coarse = torch.cat((1.0 - coarse_pred, coarse_pred), dim=1)
 
-        semantic_information = self.dynamic_selection(support_mask.clone(), coarse_pred.clone(), spt_weighted_fts, qry_weighted_fts, coff)
+        preds_coarse = torch.cat((1.0 - coarse_pred, coarse_pred), dim=1)  # (1, 2, 256, 256)
+       
+        align_loss = torch.zeros(1).to(self.device)
+        if train:
+            # spt_fts: (1, C, h, w)  qry_fts: (1, C, h, w)
+            spt_fts_align = spt_fts.unsqueeze(0)    # (1, 1, C, h, w)
+            qry_fts_align = qry_fts                 # (1, C, h, w)
+            preds = preds_coarse                    # (1, 2, 256, 256)
+            supp_mask = support_mask.unsqueeze(0)   # (1, 1, 256, 256)
+            align_loss_epi = self.alignLoss(spt_fts_align, qry_fts_align, preds, supp_mask)
+            align_loss += align_loss_epi
+        
+        semantic_information = self.dynamic_selection(support_mask.clone(), coarse_pred.clone(), spt_weighted_fts, qry_weighted_fts, coff) 
+
 
         ################################ Semantic Information Guided Correlation Estimation ###########################  
         spt_hidden_fts.append(spt_weighted_fts)
         qry_hidden_fts.append(qry_weighted_fts)
        
         spt_fts = self.mask_feature(spt_hidden_fts, support_mask.clone())
-        corr = Correlation.multilayer_correlation_new(qry_hidden_fts, spt_hidden_fts, self.stack_ids, semantic_information)
+        corr = Correlation.multilayer_correlation_new(qry_hidden_fts, spt_fts, self.stack_ids, semantic_information)
+        
+       
+        # ##################################### Similarity Calculation ####################################### 
+        # support_feats = self.mask_feature(support_feats, support_mask.clone())
+        # corr = Correlation.multilayer_correlation_new(query_feats, support_feats, self.stack_ids, middle_prototypes)
         # #####################################################################################################
 
  
@@ -508,7 +535,7 @@ class FewShotSeg(nn.Module):
         if not self.use_original_imgsize:
             logit_mask = F.interpolate(logit_mask, size=img_size, mode='bilinear', align_corners=True)
 
-        return logit_mask, loss_spt_middle, loss_qry_middle, preds_coarse
+        return logit_mask, loss_spt_middle, loss_qry_middle, preds_coarse, align_loss
     
     
     # designed functions
@@ -625,7 +652,7 @@ class FewShotSeg(nn.Module):
             logit_mask = F.interpolate(logit_mask, size=org_qry_imsize, mode='bilinear', align_corners=True)
             
 
-        visualize_segmentation_tensor(logit_mask)
+        # visualize_segmentation_tensor(logit_mask)
         # Get the predicted mask
         pred_mask = logit_mask.argmax(dim=1)
 
@@ -706,6 +733,7 @@ class FewShotSeg(nn.Module):
                 median_index = indices[median_pos].item()
                 proto = fts_masked_nonzero[:, :, median_index]
             else:
+                # employ mean-value based prototype for replacing
                 proto = torch.sum(fts * pred[None, ...], dim=(-2, -1)) \
                      / (pred[None, ...].sum(dim=(-2, -1)) + 1e-5)
             
@@ -721,6 +749,7 @@ class FewShotSeg(nn.Module):
         coff: (1)
         """
 
+        # Step 2: Semantic Information Gaining # 
         B, C, h, w = spt_fts.size()
         qry_mask = qry_mask.squeeze(0)  # (1, H, W)
         B, H, W = qry_mask.size()
@@ -737,7 +766,7 @@ class FewShotSeg(nn.Module):
         proto_mean = self.middle_fusion(spt_proto_mean, qry_proto_mean)         # (1, 512)
         proto_median = self.middle_fusion(spt_proto_median, qry_proto_median)   # (1, 512)
 
-        # chunk for channels
+        # Step 3: Dynamic Channels Selection # 
         proto_mean_chunks = proto_mean.chunk(2, dim=1)  
         proto_median_chunks = proto_median.chunk(2, dim=1)
         proto = torch.cat([
@@ -761,7 +790,114 @@ class FewShotSeg(nn.Module):
 
         return proto
 
+    def alignLoss(self, supp_fts, qry_fts, pred, fore_mask):
+        """
+        supp_fts: (1, 1, C, h', w')
+        fore_mask: (1, 1, H, W)
+        """
+        n_ways, n_shots = len(fore_mask), len(fore_mask[0])
 
+        # Get query mask
+        pred_mask = pred.argmax(dim=1, keepdim=True).squeeze(1)  # N x H' x W'
+        binary_masks = [pred_mask == i for i in range(1 + n_ways)]
+        skip_ways = [i for i in range(n_ways) if binary_masks[i + 1].sum() == 0]
+        pred_mask = torch.stack(binary_masks, dim=0).float()  # (1 + Wa) x N x H' x W'
+
+        # Compute the support loss
+        loss = torch.zeros(1).to(self.device)
+        
+        # Learn the threshold
+        mask_ = fore_mask.squeeze(0)  # (1, H, W)
+        fts_ = supp_fts.squeeze(0)    # (1, C, h', w')
+        fts_ = F.interpolate(fts_, size=mask_.shape[-2:], mode='bilinear')
+        t = self.learnThreshold_a(fts_)
+        t = torch.flatten(t, 1)
+        t = self.learnThreshold_b(t)
+
+        for way in range(n_ways):
+            if way in skip_ways:
+                continue
+            # Get the query prototypes
+            for shot in range(n_shots):
+                # Get prototypes
+                qry_fts_ = [self.getFeatures(qry_fts, pred_mask[way + 1])]
+                fg_prototypes = self.getPrototype([qry_fts_])
+
+                # Get predictions
+                supp_pred = self.getPred(supp_fts[way, [shot]], fg_prototypes[way], t)  # N x Wa x H' x W'
+                supp_pred = F.interpolate(supp_pred[None, ...], size=fore_mask.shape[-2:], mode='bilinear',
+                                           align_corners=True)
+
+
+                # Combine predictions of different feature maps
+                preds = supp_pred
+                pred_ups = torch.cat((1.0 - preds, preds), dim=1)
+
+                # Construct the support Ground-Truth segmentation
+                supp_label = torch.full_like(fore_mask[way, shot], 255, device=fore_mask.device)
+                supp_label[fore_mask[way, shot] == 1] = 1
+                supp_label[fore_mask[way, shot] == 0] = 0
+
+                # Compute Loss
+                eps = torch.finfo(torch.float32).eps
+                log_prob = torch.log(torch.clamp(pred_ups, eps, 1 - eps))
+                loss += self.criterion(log_prob, supp_label[None, ...].long()) / n_shots / n_ways
+
+        return loss
+    
+    def getFeatures(self, fts, mask):
+        """
+        Extract foreground and background features via masked average pooling
+
+        Args:
+            fts: input features, expect shape: 1 x C x H' x W'
+            mask: binary mask, expect shape: 1 x H x W
+        """
+
+        fts = F.interpolate(fts, size=mask.shape[-2:], mode='bilinear')
+        
+        # masked fg features
+        masked_fts = torch.sum(fts * mask[None, ...], dim=(-2, -1)) \
+                     / (mask[None, ...].sum(dim=(-2, -1)) + 1e-5)  # 1 x C
+
+        return masked_fts
+    
+    def getPrototype(self, fg_fts):
+        """
+        Average the features to obtain the prototype
+
+        Args:
+            fg_fts: lists of list of foreground features for each way/shot
+                expect shape: Wa x Sh x [1 x C]
+            bg_fts: lists of list of background features for each way/shot
+                expect shape: Wa x Sh x [1 x C]
+        """
+
+        n_ways, n_shots = len(fg_fts), len(fg_fts[0])
+        fg_prototypes = [torch.sum(torch.cat([tr for tr in way], dim=0), dim=0, keepdim=True) / n_shots for way in
+                         fg_fts]  ## concat all fg_fts
+
+        return fg_prototypes
+    
+    def getPred(self, fts, prototype, thresh):
+        """
+        Calculate the distance between features and prototypes
+
+        Args:
+            fts: input features
+                expect shape: N x C x H x W
+            prototype: prototype of one semantic class
+                expect shape: 1 x C
+        """
+
+        sim = -F.cosine_similarity(fts, prototype[..., None, None], dim=1) * self.scaler
+        pred = 1.0 - torch.sigmoid(0.5 * (sim - thresh))
+
+        return pred
+
+        
+
+        
 
 
 
