@@ -148,12 +148,12 @@ def main(_run, _config, _log):
             query_labels = torch.cat([query_label.long().cuda() for query_label in sample['query_labels']], dim=0)
 
             # Compute outputs and losses.
-            query_pred, loss_spt_middle, loss_qry_middle, pred_coarse, loss_align = model(support_images, support_fg_mask, query_images, query_labels, train=True)
+            query_pred, loss_spt_middle, loss_qry_middle, pred_coarse, loss_align, loss_mse = model(support_images, support_fg_mask, query_images, query_labels, train=True)
 
             loss = model.module.compute_objective(query_pred.float(), query_labels)
             loss_coarse = model.module.compute_objective(pred_coarse.float(), query_labels)
 
-            loss_whole = loss + loss_spt_middle + loss_qry_middle + loss_coarse + loss_align
+            loss_whole = loss + loss_spt_middle + loss_qry_middle + loss_coarse + loss_align + loss_mse
 
             # query_pred = torch.argmax(query_pred, dim=1)
             # pixel_acc = pixel_accuracy(query_pred.detach().data.cpu().numpy(), query_labels.detach().data.cpu().numpy())
