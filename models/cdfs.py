@@ -408,6 +408,7 @@ class FewShotSeg(nn.Module):
         self.backbone.eval()
         self.hpn_learner = MixedLearner(list(reversed(nbottlenecks[-3:])))
         self.cross_entropy_loss = nn.CrossEntropyLoss()
+        self.criterion_MSE = nn.MSELoss()
 
         # myself blocks
         self.scaler = 20.0
@@ -434,15 +435,14 @@ class FewShotSeg(nn.Module):
         self.factor_learning = factor_learning(dim=512) 
 
         self.channel_importance = nn.Sequential(
-            nn.Linear(1024, 256), 
+            nn.Linear(512, 256), 
             nn.ReLU(),
-            nn.Linear(256, 1024),
+            nn.Linear(256, 512),
             nn.Sigmoid()
         )
 
         self.adaptive_pool = nn.AdaptiveAvgPool1d(512)
 
-        self.device = torch.device('cuda')
 
 
 
@@ -511,8 +511,17 @@ class FewShotSeg(nn.Module):
             align_loss_epi = self.alignLoss(spt_fts_align, qry_fts_align, preds, supp_mask)
             align_loss += align_loss_epi
         
+        
         semantic_information = self.dynamic_selection(support_mask.clone(), coarse_pred.clone(), spt_weighted_fts, qry_weighted_fts, coff) 
 
+        mse_loss = torch.zeros(1).to(self.device)
+        if train:
+            spt_fts_mse = spt_fts.unsqueeze(0)   # (1, 1, C, h, w)
+            qry_fts_mse = qry_fts                # (1, C, h, w)
+            proto_mse = []
+            proto_mse.append(semantic_information)
+            proto_mse_loss_epi = self.proto_mse(qry_fts_mse, preds_coarse, spt_fts_mse, proto_mse)
+            mse_loss += proto_mse_loss_epi
 
         ################################ Semantic Information Guided Correlation Estimation ###########################  
         spt_hidden_fts.append(spt_weighted_fts)
@@ -535,7 +544,7 @@ class FewShotSeg(nn.Module):
         if not self.use_original_imgsize:
             logit_mask = F.interpolate(logit_mask, size=img_size, mode='bilinear', align_corners=True)
 
-        return logit_mask, loss_spt_middle, loss_qry_middle, preds_coarse, align_loss
+        return logit_mask, loss_spt_middle, loss_qry_middle, preds_coarse, align_loss, mse_loss
     
     
     # designed functions
@@ -767,12 +776,27 @@ class FewShotSeg(nn.Module):
         proto_median = self.middle_fusion(spt_proto_median, qry_proto_median)   # (1, 512)
 
         # Step 3: Dynamic Channels Selection # 
-        proto_mean_chunks = proto_mean.chunk(2, dim=1)  
-        proto_median_chunks = proto_median.chunk(2, dim=1)
-        proto = torch.cat([
-            torch.cat([proto_mean_chunks[0], proto_median_chunks[0]], dim=1),
-            torch.cat([proto_mean_chunks[1], proto_median_chunks[1]], dim=1)
-        ], dim=1)   # (1, 1024)
+
+        ### channel randomization 
+        _, C_mean = proto_mean.size()
+        chosen_slices_num_1 = C_mean // 2  
+        indices_mean = torch.randperm(proto_mean.size(1))[:chosen_slices_num_1]
+        sampled_proto_mean = proto_mean[:, indices_mean]                       # (1, 256)
+        
+        _, C_median = proto_median.size()
+        chosen_slices_num_2 = C_median // 2
+        indices_median = torch.randperm(proto_median.size(1))[:chosen_slices_num_2] 
+        sampled_proto_median = proto_median[:, indices_median]                 # (1, 256)
+
+        # concatenate
+        proto = torch.cat([sampled_proto_mean, sampled_proto_median], dim=1)  # (1, 512)
+     
+        # proto_mean_chunks = proto_mean.chunk(2, dim=1)  
+        # proto_median_chunks = proto_median.chunk(2, dim=1)
+        # proto = torch.cat([
+        #     torch.cat([proto_mean_chunks[0], proto_median_chunks[0]], dim=1),
+        #     torch.cat([proto_mean_chunks[1], proto_median_chunks[1]], dim=1)
+        # ], dim=1)   # (1, 1024)
 
         _, feat_dim = proto.shape
         
@@ -787,6 +811,7 @@ class FewShotSeg(nn.Module):
         proto = proto.unsqueeze(1)
         proto = self.adaptive_pool(proto)   
         proto = proto.squeeze(1)
+
 
         return proto
 
@@ -894,6 +919,43 @@ class FewShotSeg(nn.Module):
         pred = 1.0 - torch.sigmoid(0.5 * (sim - thresh))
 
         return pred
+    
+    def proto_mse(self, qry_fts, pred, fore_mask, supp_prototypes):
+        n_ways, n_shots = len(fore_mask), len(fore_mask[0])
+
+        pred_mask = pred.argmax(dim=1, keepdim=True).squeeze(1)
+        binary_masks = [pred_mask == i for i in range(1 + n_ways)]
+        skip_ways = [i for i in range(n_ways) if binary_masks[i + 1].sum() == 0]
+        pred_mask = torch.stack(binary_masks, dim=0).float()  # (1 + Wa) x N x H' x W'
+
+        # Compute the support loss
+        loss_sim = torch.zeros(1).to(self.device)
+        for way in range(n_ways): 
+            if way in skip_ways:
+                continue
+            for shot in range(n_shots):
+                # Get prototypes
+                qry_fts_ = [[self.getFeatures(qry_fts, pred_mask[way + 1])]]
+
+                fg_prototypes = self.getPrototype(qry_fts_)
+
+                fg_prototypes_ = torch.sum(torch.stack(fg_prototypes, dim=0), dim=0)
+                supp_prototypes_ = torch.sum(torch.stack(supp_prototypes, dim=0), dim=0)
+                
+                # Combine prototypes from different scales
+                # fg_prototypes = self.alpha * fg_prototypes[way]
+                # fg_prototypes = torch.sum(torch.stack(fg_prototypes, dim=0), dim=0) / torch.sum(self.alpha)
+                # supp_prototypes_ = [self.alpha[n] * supp_prototypes[n][way] for n in range(len(supp_fts))]
+                # supp_prototypes_ = torch.sum(torch.stack(supp_prototypes_, dim=0), dim=0) / torch.sum(self.alpha)
+
+                # Compute the MSE loss
+
+                loss_sim += self.criterion_MSE(fg_prototypes_, supp_prototypes_)
+            
+        return loss_sim
+            
+
+        
 
         
 
