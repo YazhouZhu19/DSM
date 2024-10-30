@@ -585,10 +585,6 @@ class FewShotSeg(nn.Module):
 
     def middle_information(self, spt_pred, qry_pred, spt_fts, qry_fts):
 
-        """
-        使用加权均值和加权中位数计算 原型 
-        """
-
         def weighted_prototype(fts, pred, method): 
             if method == 'mean': 
                 proto = torch.sum(fts * pred[None, ...], dim=(-2, -1)) \
