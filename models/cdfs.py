@@ -175,7 +175,7 @@ class innerProtoFusion(nn.Module):
         v = self.value(prototypes)  # (n, 1, 512)
         
         # Compute attention weights
-        attn_weights = torch.bmm(q, k.transpose(1, 2))  # (n, 1, 1)
+        attn_weights = torch.bmm(q, k.transpose(1, 2))     # (n, 1, 1)
         attn_weights = torch.softmax(attn_weights, dim=0)  # (n, 1, 1)
         
         # Weighted sum
@@ -485,7 +485,7 @@ class FewShotSeg(nn.Module):
         # support_feats = self.extract_feats(support_img, self.backbone, self.feat_ids, self.bottleneck_ids, self.lids)
         
         num_inner_layer = len(self.feat_ids)
-        # inner features  
+        # inner features    
         middle_prototypes = []
 
         ################################### Support-query features re-weighting ##################################
