@@ -1,4 +1,4 @@
-### Enhancing Generalization of Few-shot Medical Image Segmentation via Dynamic Semantic Matching
+### Cross-domain Few-shot Medical Image Segmentation via Dynamic Semantic Matching
 
 
 #### Breif Introduction
