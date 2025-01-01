@@ -6,4 +6,4 @@ Cross-domain few-shot medical image segmentation (CDFSMIS) presents the fundamen
 
 
 
-![](./pics/dsm_1.png)
+![](./dsm_1.png)
