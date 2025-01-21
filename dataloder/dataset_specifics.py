@@ -1,8 +1,3 @@
-"""
-Dataset Specifics
-Extended from ADNet code by Hansen et al.
-"""
-
 import torch
 import random
 
@@ -157,6 +152,27 @@ def get_label_names(dataset):
     elif dataset == 'MSD_CT_Spleen':
         label_names[0] = 'BG'
         label_names[1] = 'Spleen'
+    elif dataset == 'MI-PRO':
+        label_names[0] = 'BG'
+        label_names[1] = 'Bladder'
+        label_names[2] = 'Bone'
+        label_names[3] = 'Obturator_Internus'
+        label_names[4] = 'Transition_Zone'
+        label_names[5] = 'Central_Gland'
+        label_names[6] = 'Rectum'
+        label_names[7] = 'Seminal_Vesicle'
+        label_names[8] = 'Neurovascular_Bundle'
+    elif dataset == 'MS-CMR':
+        label_names[0] = 'BG'
+        label_names[1] = 'LV-MYO'
+        label_names[2] = 'LV-BP'
+        label_names[3] = 'RV'
+    elif dataset == 'Chest-X-Ray':
+        label_names[0] = 'BG'
+        label_names[1] = 'Lung'
+    elif dataset == 'ISIC':
+        label_names[0] = 'BG'
+        label_names[1] = 'skin'
     return label_names
 
 
@@ -305,6 +321,27 @@ def get_folds(dataset):
     elif dataset == 'MSD_CT_Spleen':
         FOLD[0] = set(range(0, 40))
         return FOLD
+    elif dataset == 'MI-PRO':
+        FOLD[0] = set(range(1, 81))
+        FOLD[1] = set(range(80, 161))
+        FOLD[2] = set(range(160, 221))
+        FOLD[3] = set(range(220, 301))
+        FOLD[4] = set(range(300, 403))
+        return FOLD
+    elif dataset == 'MS-CMR': 
+        FOLD[0] = set(range(1, 19))
+        FOLD[1] = set(range(18, 37))
+        FOLD[2] = set(range(36, 55))
+        FOLD[3] = set(range(54, 73))
+        FOLD[4] = set(range(72, 90))
+        return FOLD
+    elif dataset == 'Chest-X-Ray':
+        FOLD[0] = set(range(1, 141))
+        FOLD[1] = set(range(140, 281))
+        FOLD[2] = set(range(280, 421))
+        FOLD[3] = set(range(420, 561))
+        FOLD[4] = set(range(560, 704))
+        return FOLD 
     else:
         raise ValueError(f'Dataset: {dataset} not found')
 
