@@ -4,7 +4,7 @@ GPUID1=1
 export CUDA_VISIBLE_DEVICES=$GPUID1
 
 ###### Shared configs ######
-DATASET='ABDOMEN_MRI'
+DATASET='' # Multiple Target Medical Datasets
 #DATASET='CMR'
 NWORKER=16
 RUNS=1
