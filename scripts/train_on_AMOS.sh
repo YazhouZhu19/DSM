@@ -4,7 +4,7 @@ GPUID1=1
 export CUDA_VISIBLE_DEVICES=$GPUID1
 
 ###### Shared configs ######
-DATASET='ABDOMEN_CT'
+DATASET='AMOS'
 NWORKER=16
 RUNS=1
 ALL_EV=(0) # 5-fold cross validation (0, 1, 2, 3, 4)
