@@ -30,27 +30,6 @@ import matplotlib.pyplot as plt
 from mamba_ssm import Mamba 
 
 
-# def visualize_segmentation_tensor(tensor):
-#     # Ensure the tensor is on CPU and detach from computation graph
-#     tensor = tensor.cpu().detach()
-
-#     # Squeeze the batch dimension
-#     tensor = tensor.squeeze(0)
-
-#     # Get the predicted class for each pixel (argmax along channel dimension)
-#     predicted_mask = torch.argmax(tensor, dim=0).numpy()
-
-#     # Create a color map: 0 -> black, 1 -> white
-#     cmap = plt.cm.gray
-
-#     # Create the plot
-#     plt.figure(figsize=(10, 10))
-#     plt.imshow(predicted_mask, cmap=cmap, interpolation='nearest')
-#     plt.colorbar()
-#     plt.title("Segmentation Mask")
-#     plt.axis('off')
-#     plt.show()
-
 
 class AttentionFusion(nn.Module):
     def __init__(self, input_dim, attention_type='self', num_heads=8):
