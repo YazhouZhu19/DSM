@@ -1,19 +1,17 @@
 #!/usr/bin/env python
 """
 For evaluation
-Extended from ADNet code by Hansen et al.
 """
 import shutil
 import SimpleITK as sitk
 import torch.backends.cudnn as cudnn
 import torch.optim
 from torch.utils.data import DataLoader
-from models.cdfs_dsm import FewShotSeg
+from models.cdfs_dsm_v2 import FewShotSeg
 from dataloaders.datasets import TestDataset
 from dataloaders.dataset_specifics import *
 from utils import *
 from config import ex
-from evaluation import Evaluator
 
 
 @ex.automain
@@ -48,27 +46,9 @@ def main(_run, _config, _log):
     torch.set_num_threads(1)
 
     _log.info(f'Create model...')
-    model_config = {
-        # 'data_dir': _config['path'][_config['dataset']]['data_dir'],
-        'dataset': _config['dataset'],
-        'PREC': _config['PREC'],
-        # 'train_classname': _config['train_classname'],
-        # 'test_classname': _config['test_classname'],
-        'BACKBONE_NAME': _config['BACKBONE_NAME'],
-        'N_CTX': _config['N_CTX'],
-        'CTX_INIT': _config['CTX_INIT'],
-        'CLASS_TOKEN_POSITION': _config['CLASS_TOKEN_POSITION'],
-        'INPUT_SIZE': _config['INPUT_SIZE'],
-        'CSC': _config['CSC'],
-        'INIT_WEIGHTS': _config['INIT_WEIGHTS'],
-        'OPTIM': _config['OPTIM'],
-        'PROMPT_INIT': _config['PROMPT_INIT'],
-        # 'classnames': _config['classnames'],
-    }
-    model = FewShotSeg(model_config, backbone='vgg16', use_original_imgsize=False)
-    model = nn.DataParallel(model)
+    model = FewShotSeg()
     model.cuda()
-    model.load_state_dict(torch.load(_config['reload_model_path'], map_location='cpu'), strict=False)
+    model.load_state_dict(torch.load(_config['reload_model_path'], map_location='cpu'))
 
     _log.info(f'Load data...')
     data_config = {
@@ -87,7 +67,7 @@ def main(_run, _config, _log):
     test_dataset = TestDataset(data_config)
     test_loader = DataLoader(test_dataset,
                              batch_size=_config['batch_size'],
-                             shuffle=True,
+                             shuffle=False,
                              num_workers=_config['num_workers'],
                              pin_memory=True,
                              drop_last=True)
@@ -112,8 +92,6 @@ def main(_run, _config, _log):
 
         # Get support sample + mask for current class.
         support_sample = test_dataset.getSupport(label=label_val, all_slices=False, N=_config['n_part'])
-        # support_sample['image']: (3, 3, 256, 256)
-        # support_sample['label']: (3, 256, 256)
 
         test_dataset.label = label_val
 
@@ -137,8 +115,6 @@ def main(_run, _config, _log):
                 query_label = sample['label'].long()  # C x H x W
                 query_id = sample['id'][0].split('image_')[1][:-len('.nii.gz')]
 
-                prompt = _config['dataset']
-
                 # Compute output.
                 # Match support slice and query sub-chunck.
                 query_pred = torch.zeros(query_label.shape[-3:])
@@ -151,17 +127,12 @@ def main(_run, _config, _log):
                     query_image_s = query_image[0][idx_[sub_chunck]:idx_[sub_chunck + 1]]  # C' x 3 x H x W
                     query_pred_s = []
                     for i in range(query_image_s.shape[0]):
-                        # _pred_s= model([support_image_s], [support_fg_mask_s], [query_image_s[[i]]], _, prompt, train=False)  # 1 x 2 x H x W
-
-                        # _pred_s= model.module.predict_mask([support_image_s], [support_fg_mask_s], [query_image_s[[i]]], _, prompt, train=False)                    
-                        _pred_s, _, _, _ = model([support_image_s], [support_fg_mask_s], [query_image_s[[i]]], _, train=False)  # 1 x 2 x H x W
+                        _pred_s, _, _, _, _ = model([support_image_s], [support_fg_mask_s], [query_image_s[[i]]], _, train=False)  # 1 x 2 x H x W
                         query_pred_s.append(_pred_s)
-
                     query_pred_s = torch.cat(query_pred_s, dim=0)
                     query_pred_s = query_pred_s.argmax(dim=1).cpu()  # C x H x W
                     query_pred[idx_[sub_chunck]:idx_[sub_chunck + 1]] = query_pred_s
-     
-                
+
                 # Record scores.
                 scores.record(query_pred, query_label)
 
@@ -188,14 +159,16 @@ def main(_run, _config, _log):
     _log.info(f'Mean IoU: {class_iou}')
     _log.info(f'Mean Dice: {class_dice}')
 
-
     def dict_Avg(Dict):
         L = len(Dict)  # 取字典中键值对的个数
         S = sum(Dict.values())  # 取字典中键对应值的总和
         A = S / L
         return A
 
-    _log.info(f'Whole mean Dice: {dict_Avg(class_dice)}')
+    value = dict_Avg(class_dice)
+    with open('results.txt', 'w') as file:
+        file.write(str(value))
 
+    _log.info(f'Whole mean Dice: {dict_Avg(class_dice)}')
     _log.info(f'End of validation.')
     return 1
