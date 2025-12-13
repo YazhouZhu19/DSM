@@ -9,7 +9,7 @@ import torch.backends.cudnn as cudnn
 import torch.optim
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import MultiStepLR
-from models.cdfs_dsm_v2 import FewShotSeg
+from models.cdfs_dsm import FewShotSeg
 from dataloaders.datasets import TrainDataset as TrainDataset
 from utils import *
 from config import ex
