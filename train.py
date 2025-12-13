@@ -1,8 +1,4 @@
 #!/usr/bin/env python
-"""
-For Evaluation
-Extended from ADNet code by Hansen et al.
-"""
 import os
 import random
 import logging
@@ -13,19 +9,11 @@ import torch.backends.cudnn as cudnn
 import torch.optim
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import MultiStepLR
-from models.cdfs_dsm import FewShotSeg
+from models.cdfs_dsm_v2 import FewShotSeg
 from dataloaders.datasets import TrainDataset as TrainDataset
-from dataloaders.dataset_specifics import *
 from utils import *
 from config import ex
-from sklearn.metrics import accuracy_score, jaccard_score
-
-
-def pixel_accuracy(pred, label):
-    pred_flatten = pred.flatten()
-    label_flatten = label.flatten()
-    accuracy = accuracy_score(label_flatten, pred_flatten)
-    return accuracy
+# from losses import *
 
 
 @ex.automain
@@ -61,27 +49,7 @@ def main(_run, _config, _log):
     torch.set_num_threads(1)
 
     _log.info(f'Create model...')
-    
-    model_config = {
-        # 'data_dir': _config['path'][_config['dataset']]['data_dir'],
-        'dataset': _config['dataset'],
-        'PREC': _config['PREC'],
-        # 'train_classname': _config['train_classname'],
-        # 'test_classname': _config['test_classname'],
-        'BACKBONE_NAME': _config['BACKBONE_NAME'],
-        'N_CTX': _config['N_CTX'],
-        'CTX_INIT': _config['CTX_INIT'],
-        'CLASS_TOKEN_POSITION': _config['CLASS_TOKEN_POSITION'],
-        'INPUT_SIZE': _config['INPUT_SIZE'],
-        'CSC': _config['CSC'],
-        'INIT_WEIGHTS': _config['INIT_WEIGHTS'],
-        'OPTIM': _config['OPTIM'],
-        'PROMPT_INIT': _config['PROMPT_INIT'],
-        # 'classnames': _config['classnames'],
-    }
-    
-    model = FewShotSeg(model_config, backbone='vgg16', use_original_imgsize=False)
-    model = nn.DataParallel(model)
+    model = FewShotSeg()
     model = model.cuda()
     model.train()
 
@@ -92,9 +60,8 @@ def main(_run, _config, _log):
     scheduler = MultiStepLR(optimizer, milestones=lr_milestones, gamma=_config['lr_step_gamma'])
 
     my_weight = torch.FloatTensor([0.1, 1.0]).cuda()
-    criterion_BCE = nn.NLLLoss(ignore_index=255, weight=my_weight)
-    # criterion = nn.CrossEntropyLoss()
-    criterion_Dice = DiceLoss(num_classes=2)
+    criterion = nn.NLLLoss(ignore_index=255, weight=my_weight)
+    # criterion_dice = DiceLoss()
 
     _log.info(f'Load data...')
     data_config = {
@@ -111,8 +78,6 @@ def main(_run, _config, _log):
         'test_label': _config['test_label'],
         'exclude_label': _config['exclude_label'],
         'use_gt': _config['use_gt'],
-        'train_organ': _config['train_organ'],
-
     }
     train_dataset = TrainDataset(data_config)
     train_loader = DataLoader(train_dataset,
@@ -127,66 +92,61 @@ def main(_run, _config, _log):
 
     i_iter = 0
     _log.info(f'Start training...')
+
+    eta = 1.
     for sub_epoch in range(n_sub_epochs):
         _log.info(f'This is epoch "{sub_epoch}" of "{n_sub_epochs}" epochs.')
-        for _, sample in enumerate(train_loader):
 
+        for _, sample in enumerate(train_loader):
             # Prepare episode data.
             support_images = [[shot.float().cuda() for shot in way]
                               for way in sample['support_images']]
             support_fg_mask = [[shot.float().cuda() for shot in way]
                                for way in sample['support_fg_labels']]
 
-            # prompt
-            class_idx = sample['selected_class']
-            labels = get_label_names(_config['dataset'])
-            # prompt = labels[int(class_idx.item())]
-            
-            # prompt = _config['dataset']
-
             query_images = [query_image.float().cuda() for query_image in sample['query_images']]
             query_labels = torch.cat([query_label.long().cuda() for query_label in sample['query_labels']], dim=0)
 
             # Compute outputs and losses.
-            query_pred, loss_spt_middle, loss_qry_middle, pred_coarse, loss_align, loss_mse = model(support_images, support_fg_mask, query_images, query_labels, train=True)
+            query_pred, bce_loss, align_loss, mse_loss, qry_loss = model(support_images, support_fg_mask,
+                                                                               query_images, query_labels, train=True)
 
-            loss = model.module.compute_objective(query_pred.float(), query_labels)
-            loss_coarse = model.module.compute_objective(pred_coarse.float(), query_labels)
+            query_loss = criterion(torch.log(torch.clamp(query_pred, torch.finfo(torch.float32).eps,
+                                                         1 - torch.finfo(torch.float32).eps)), query_labels)
 
-            loss_whole = loss + loss_spt_middle + loss_qry_middle + loss_coarse + loss_align + loss_mse
+            # bd_loss = criterion_bd(query_pred, query_labels)
+            # dice_loss = criterion_dice(query_pred, query_labels)
 
-            # query_pred = torch.argmax(query_pred, dim=1)
-            # pixel_acc = pixel_accuracy(query_pred.detach().data.cpu().numpy(), query_labels.detach().data.cpu().numpy())
-            # print(pixel_acc)      
-        
+            loss = query_loss + align_loss + qry_loss + 0.1 * bce_loss + 0.1 * mse_loss
+
             # Compute gradient and do SGD step.
             for param in model.parameters():
                 param.grad = None
 
-            loss_whole.backward()
+            loss.backward()
             optimizer.step()
             scheduler.step()
 
             # Log loss
-            loss = loss.detach().data.cpu().numpy()
+            query_loss = query_loss.detach().data.cpu().numpy()
+            # align_loss = align_loss.detach().data.cpu().numpy()
 
             _run.log_scalar('total_loss', loss.item())
-            # _run.log_scalar('query_loss', query_loss)
+            _run.log_scalar('query_loss', query_loss)
 
             log_loss['total_loss'] += loss.item()
-            # log_loss['query_loss'] += query_loss
+            log_loss['query_loss'] += query_loss
 
             # Print loss and take snapshots.
             if (i_iter + 1) % _config['print_interval'] == 0:
-
                 total_loss = log_loss['total_loss'] / _config['print_interval']
-                # query_loss = log_loss['query_loss'] / _config['print_interval']
+                query_loss = log_loss['query_loss'] / _config['print_interval']
 
                 log_loss['total_loss'] = 0
-                # log_loss['query_loss'] = 0
+                log_loss['query_loss'] = 0
 
-                _log.info(f'step {i_iter + 1}: total_loss: {total_loss}')
-                          # f' align_loss: {align_loss}')
+                _log.info(f'step {i_iter + 1}: total_loss: {total_loss}, query_loss: {query_loss},'
+                          )
 
             if (i_iter + 1) % _config['save_snapshot_every'] == 0:
                 _log.info('###### Taking snapshot ######')
@@ -194,6 +154,8 @@ def main(_run, _config, _log):
                            os.path.join(f'{_run.observers[0].dir}/snapshots', f'{i_iter + 1}.pth'))
 
             i_iter += 1
+
+        eta = eta - 0.01
 
     _log.info('End of training.')
     return 1
